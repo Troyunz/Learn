@@ -25,8 +25,8 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | 1 — Internet & system-design foundations | 17 | 1–17 | ✅ Complete |
 | 2 — Scaling | 22 | 18–39 | ✅ Complete |
 | 3 — Data & storage | 24 | 40–63 | ✅ **Complete (L55, L59, L63 added; wrap-up done)** |
-| 4 — Distributed systems | 29 | 64–92 | ⏳ In progress — L64–89 done |
-| 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ Not started |
+| 4 — Distributed systems | 29 | 64–92 | ✅ **Complete (L64–92 + wrap-up)** |
+| 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ Not started — **next** |
 
 ## Files
 
@@ -54,6 +54,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | [phase-4-part-5.md](./phase-4-part-5.md) | 76–79 | Backpressure & load shedding, circuit breakers/bulkheads, locks & leases, leader election |
 | [phase-4-part-6.md](./phase-4-part-6.md) | 80–85 | Quorums, consensus & Raft, distributed transactions, 2PC, sagas, outbox & CDC |
 | [phase-4-part-7.md](./phase-4-part-7.md) | 86–89 | Monoliths vs microservices, discovery & config, observability, SLIs/SLOs |
+| [phase-4-part-8.md](./phase-4-part-8.md) | 90–92 + wrap-up | HA & DR, active-passive vs active-active, RTO/RPO, **Phase 4 revision sheet, glossary, 20 quiz questions, exercises** |
 | phase-5-part-*.md | 93–106 | The 14 full system designs — *not started* |
 
 > **Note on `_chunks/`**: this directory holds raw generation output from the original build. Every Phase 4 draft it contained has now been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
@@ -161,10 +162,10 @@ Legend: `[x]` complete · `[ ]` not started
 - [x] 24. Service discovery and configuration management — L87 ✳ *(written 2026-10)*
 - [x] 25. Observability: logs, metrics, traces — L88 ✳ *(written 2026-10)*
 - [x] 26. SLIs, SLOs and error budgets — L89 ✳ *(written 2026-10)*
-- [ ] 27. High availability and disaster recovery — L90
-- [ ] 28. Active-passive versus active-active — L91
-- [ ] 29. RTO and RPO — L92
-- [ ] Phase 4 wrap-up
+- [x] 27. High availability and disaster recovery — L90 ✳ *(written 2026-10)*
+- [x] 28. Active-passive versus active-active — L91 ✳ *(written 2026-10)*
+- [x] 29. RTO and RPO — L92 ✳ *(written 2026-10)*
+- [x] Phase 4 wrap-up ✳ *(revision sheet, glossary, 20 quiz questions, 5 exercises, mini design, interview questions)*
 
 ### Phase 5 — Complete system-design exercises (L93–L106)
 - [ ] 1. Pastebin · 2. URL shortener · 3. Rate limiter · 4. Notification service
@@ -175,6 +176,6 @@ Legend: `[x]` complete · `[ ]` not started
 
 ---
 
-**NEXT: Phase 4, Topic 27 — High availability and disaster recovery (L90)**
+**NEXT: Phase 5, Topic 1 — Design Pastebin (L93)**
 
 For the precise state of every file — including orphaned drafts, stale inline checklists, and the remaining work plan — see [../AUDIT.md](../AUDIT.md).

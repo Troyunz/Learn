@@ -11,7 +11,7 @@
 | 1 — Foundations | 1–17 + wrap-up | ✅ Complete | ✅ Complete |
 | 2 — Scaling | 18–39 + wrap-up | ✅ Complete (index wrongly said "wrap-up pending") | ✅ Complete |
 | 3 — Data & storage | 40–63 + wrap-up | ⚠️ **3 lessons missing** (L55, L59, L63), wrap-up written but referenced the missing lessons | ✅ **Complete** |
-| 4 — Distributed systems | 64–92 + wrap-up | ⚠️ 5 of 29 lessons existed as **unmerged drafts** (L64, 67, 70, 73, 85) in `_chunks/` | 🔄 **26 of 29 done**: L64–89 written/merged; **all drafts merged** |
+| 4 — Distributed systems | 64–92 + wrap-up | ⚠️ 5 of 29 lessons existed as **unmerged drafts** (L64, 67, 70, 73, 85) in `_chunks/` | ✅ **Complete**: L64–92 + wrap-up written and merged; all drafts consumed |
 | 5 — Design exercises | 93–106 + wrap-up | ❌ Nothing | ❌ Nothing |
 
 **Course body before:** 54,581 lines / ~2.9 MB. **Added in this pass:** 4 lessons (L55, L59, L63, L65, L66) plus a phase file structure — see `git log`.
@@ -81,7 +81,7 @@ Every new lesson follows the course's 17-section template and the BookNook examp
 
 ## 4. Remaining work
 
-### 4.1 Phase 4 — 3 lessons to write, 0 drafts to merge, 1 wrap-up
+### 4.1 Phase 4 — COMPLETE (0 lessons to write, 0 drafts to merge, wrap-up done)
 
 Drafts in `_chunks/` (complete, 17-section, BookNook-consistent) still to merge:
 
@@ -92,14 +92,13 @@ Drafts in `_chunks/` (complete, 17-section, BookNook-consistent) still to merge:
 | `_chunks/L73-75.md` | 73 — At-most/at-least/exactly-once | `phase-4-part-4.md` | ✅ merged |
 | `_chunks/L85-87.md` | 85 — Transactional outbox & CDC | `phase-4-part-6.md` | ✅ merged (draft extended §8–17) |
 
-Lessons still to write, in course order (3):
+Lessons written this cycle (3 + wrap-up):
 
 ```
-90  High availability & DR
-91  Active-passive vs active-active
-92  RTO and RPO
-+ Phase 4 wrap-up
-+ Phase 4 wrap-up
+90  High availability & DR                    ✅ phase-4-part-8.md
+91  Active-passive vs active-active           ✅ phase-4-part-8.md
+92  RTO and RPO                               ✅ phase-4-part-8.md
++   Phase 4 wrap-up (7-section)               ✅ phase-4-part-8.md
 ```
 
 Proposed part-file layout (5–6 lessons per file, matching the Phase 1–3 convention):
@@ -113,9 +112,9 @@ Proposed part-file layout (5–6 lessons per file, matching the Phase 1–3 conv
 | `phase-4-part-5.md` ✅ | 76–79 (done) |
 | `phase-4-part-6.md` ✅ | 80–85 (done) |
 | `phase-4-part-7.md` ✅ | 86–89 (done) |
-| `phase-4-part-8.md` 🔄 | 90–92 + Phase 4 wrap-up (next) |
+| `phase-4-part-8.md` ✅ | 90–92 + Phase 4 wrap-up (done) |
 
-### 4.2 Phase 5 — 14 designs + wrap-up
+### 4.2 Phase 5 — 14 designs + wrap-up (NEXT — nothing written yet)
 
 Each design should follow the course's Phase 5 template (requirements → capacity estimation → API → data model → high-level design → deep dives → bottlenecks → evolution). Order: Pastebin, URL shortener, rate limiter, notification service, search autocomplete, file storage, web crawler, real-time chat, news feed, video streaming, ride sharing, e-commerce/inventory, payment processing, metrics & logging.
 
