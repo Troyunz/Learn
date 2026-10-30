@@ -25,7 +25,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | 1 — Internet & system-design foundations | 17 | 1–17 | ✅ Complete |
 | 2 — Scaling | 22 | 18–39 | ✅ Complete |
 | 3 — Data & storage | 24 | 40–63 | ✅ **Complete (L55, L59, L63 added; wrap-up done)** |
-| 4 — Distributed systems | 29 | 64–92 | ⏳ In progress — L64–66 done |
+| 4 — Distributed systems | 29 | 64–92 | ⏳ In progress — L64–69 done |
 | 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ Not started |
 
 ## Files
@@ -48,8 +48,8 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | [phase-3-part-4.md](./phase-3-part-4.md) | 52–55 | Optimistic vs pessimistic concurrency, indexes, index types, **query plans & index trade-offs** |
 | [phase-3-part-5.md](./phase-3-part-5.md) | 56–63 + wrap-up | Normalisation, OLTP vs OLAP, warehouses/lakes/lakehouses, **CAP**, PACELC, consistency models, storage types, **backup & DR**, Phase 3 wrap-up |
 | [phase-4-part-1.md](./phase-4-part-1.md) | 64–66 | Phase 4 intro, why distribution is hard, partial failures & partitions, clocks & ordering |
-| phase-4-part-2.md | 67–69 | Sync vs async workflows, message queues, pub/sub — *not yet written* |
-| phase-4-part-3.md | 70–72 | Event streams, queues vs logs, consumer groups — *drafted, unmerged* |
+| [phase-4-part-2.md](./phase-4-part-2.md) | 67–69 | Sync vs async workflows, message queues, publish-subscribe |
+| phase-4-part-3.md | 70–72 | Event streams, queues vs logs, consumer groups — *L70 drafted, unmerged* |
 | phase-5-part-*.md | 93–106 | The 14 full system designs — *not started* |
 
 > **Note on `_chunks/`**: this directory holds raw generation output, including draft lessons 67, 70, 73 and 85 that have not yet been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
@@ -134,9 +134,9 @@ Legend: `[x]` complete · `[ ]` not started
 - [x] 1. Why distributed systems are difficult — L64
 - [x] 2. Partial failures and network partitions — L65 ✳ *(written 2026-10)*
 - [x] 3. Clock differences and ordering events — L66 ✳ *(written 2026-10)*
-- [ ] 4. Synchronous versus asynchronous workflows — L67 *(draft in `_chunks`)*
-- [ ] 5. Message queues — L68
-- [ ] 6. Publish-subscribe systems — L69
+- [x] 4. Synchronous versus asynchronous workflows — L67
+- [x] 5. Message queues — L68 ✳ *(written 2026-10)*
+- [x] 6. Publish-subscribe systems — L69 ✳ *(written 2026-10)*
 - [ ] 7. Event streams — L70 *(draft in `_chunks`)*
 - [ ] 8. RabbitMQ-style queues versus Kafka-style logs — L71
 - [ ] 9. Consumer groups, partitions, offsets and ordering — L72
@@ -171,6 +171,6 @@ Legend: `[x]` complete · `[ ]` not started
 
 ---
 
-**NEXT: Phase 4, Topic 4 — Synchronous versus asynchronous workflows (L67), then Topic 5 — Message queues (L68)**
+**NEXT: Phase 4, Topic 7 — Event streams (L70), then Topic 8 — RabbitMQ-style queues vs Kafka-style logs (L71)**
 
 For the precise state of every file — including orphaned drafts, stale inline checklists, and the remaining work plan — see [../AUDIT.md](../AUDIT.md).
