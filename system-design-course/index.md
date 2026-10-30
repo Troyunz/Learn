@@ -26,7 +26,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | 2 — Scaling | 22 | 18–39 | ✅ Complete |
 | 3 — Data & storage | 24 | 40–63 | ✅ **Complete (L55, L59, L63 added; wrap-up done)** |
 | 4 — Distributed systems | 29 | 64–92 | ✅ **Complete (L64–92 + wrap-up)** |
-| 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ In progress — L93–101 done |
+| 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ In progress — L93–104 done |
 
 ## Files
 
@@ -57,8 +57,9 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | [phase-5-part-1.md](./phase-5-part-1.md) | 93–95 | Design Pastebin, URL shortener, rate limiter |
 | [phase-5-part-2.md](./phase-5-part-2.md) | 96–98 | Design notification service, search autocomplete, file storage |
 | [phase-5-part-3.md](./phase-5-part-3.md) | 99–101 | Design web crawler, real-time chat, news feed |
+| [phase-5-part-4.md](./phase-5-part-4.md) | 102–104 | Design video streaming, ride sharing, e-commerce & inventory |
 | [phase-4-part-8.md](./phase-4-part-8.md) | 90–92 + wrap-up | HA & DR, active-passive vs active-active, RTO/RPO, **Phase 4 revision sheet, glossary, 20 quiz questions, exercises** |
-| phase-5-part-*.md | 93–106 | The 14 full system designs — *not started* |
+| phase-5-part-5.md | 105–106 + wrap-up | Design payment processing, metrics & logging platform, Phase 5 wrap-up — *in progress* |
 
 > **Note on `_chunks/`**: this directory holds raw generation output from the original build. Every Phase 4 draft it contained has now been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
 
@@ -173,12 +174,12 @@ Legend: `[x]` complete · `[ ]` not started
 ### Phase 5 — Complete system-design exercises (L93–L106)
 - [x] 1. Pastebin (L93) ✳ · [x] 2. URL shortener (L94) ✳ · [x] 3. Rate limiter (L95) ✳ · [x] 4. Notification service (L96) ✳
 - [x] 5. Search autocomplete (L97) ✳ · [x] 6. File storage (L98) ✳ · [x] 7. Web crawler (L99) ✳ · [x] 8. Real-time chat (L100) ✳
-- [x] 9. News feed (L101) ✳ · [ ] 10. Video streaming · [ ] 11. Ride sharing · [ ] 12. E-commerce/inventory
+- [x] 9. News feed (L101) ✳ · [x] 10. Video streaming (L102) ✳ · [x] 11. Ride sharing (L103) ✳ · [x] 12. E-commerce/inventory (L104) ✳
 - [ ] 13. Payment processing · 14. Metrics and logging platform
 - [ ] Phase 5 wrap-up
 
 ---
 
-**NEXT: Phase 5, Topic 10 — Design video streaming (L102)**
+**NEXT: Phase 5, Topic 13 — Design payment processing (L105)**
 
 For the precise state of every file — including orphaned drafts, stale inline checklists, and the remaining work plan — see [../AUDIT.md](../AUDIT.md).

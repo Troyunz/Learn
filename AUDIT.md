@@ -12,7 +12,7 @@
 | 2 — Scaling | 18–39 + wrap-up | ✅ Complete (index wrongly said "wrap-up pending") | ✅ Complete |
 | 3 — Data & storage | 40–63 + wrap-up | ⚠️ **3 lessons missing** (L55, L59, L63), wrap-up written but referenced the missing lessons | ✅ **Complete** |
 | 4 — Distributed systems | 64–92 + wrap-up | ⚠️ 5 of 29 lessons existed as **unmerged drafts** (L64, 67, 70, 73, 85) in `_chunks/` | ✅ **Complete**: L64–92 + wrap-up written and merged; all drafts consumed |
-| 5 — Design exercises | 93–106 + wrap-up | ❌ Nothing | 🔄 **9 of 14 done**: L93–101 |
+| 5 — Design exercises | 93–106 + wrap-up | 🔄 In progress | 🔄 **12 of 14 done**: L93–104 |
 
 **Course body before:** 54,581 lines / ~2.9 MB. **Added in this pass:** 4 lessons (L55, L59, L63, L65, L66) plus a phase file structure — see `git log`.
 
@@ -114,14 +114,15 @@ Proposed part-file layout (5–6 lessons per file, matching the Phase 1–3 conv
 | `phase-4-part-7.md` ✅ | 86–89 (done) |
 | `phase-4-part-8.md` ✅ | 90–92 + Phase 4 wrap-up (done) |
 
-### 4.2 Phase 5 — 14 designs + wrap-up (IN PROGRESS — 3 of 14 done)
+### 4.2 Phase 5 — 14 designs + wrap-up (IN PROGRESS — 4 of 5 parts done)
 
 | File | Designs | Status |
 |---|---|---|
 | `phase-5-part-1.md` ✅ | 93 Pastebin · 94 URL shortener · 95 Rate limiter | done |
 | `phase-5-part-2.md` ✅ | 96 Notifications · 97 Autocomplete · 98 File storage | done |
 | `phase-5-part-3.md` ✅ | 99 Crawler · 100 Chat · 101 News feed | done |
-| remaining | 102 video · 103 ride sharing · 104 e-commerce · 105 payments · 106 metrics platform | 5 designs + wrap-up |
+| `phase-5-part-4.md` ✅ | 102 Video streaming · 103 Ride sharing · 104 E-commerce & inventory | done |
+| remaining | 105 payments · 106 metrics/logging platform | 2 designs + wrap-up |
 
 Each design should follow the course's Phase 5 template (requirements → capacity estimation → API → data model → high-level design → deep dives → bottlenecks → evolution). Order: Pastebin, URL shortener, rate limiter, notification service, search autocomplete, file storage, web crawler, real-time chat, news feed, video streaming, ride sharing, e-commerce/inventory, payment processing, metrics & logging.
 
