@@ -1874,6 +1874,543 @@ VACUUM gold.fact_order_line RETAIN 168 HOURS;
 
 ---
 
+# Lesson 59 — CAP Theorem
+
+*Phase 3, Topic 20*
+
+## 1. Simple definition
+
+**CAP theorem**: a distributed data store cannot simultaneously guarantee all three of the following properties.
+
+- **C — Consistency**: every read observes the most recent write, or an error. Formally, **linearizability**: the system behaves as if there were a single copy of the data and every operation took effect atomically at some instant between its invocation and its response.
+- **A — Availability**: every request that reaches a non-failed node receives a **non-error** response. Note what is missing: there is **no time bound**. A node that takes four hours to answer is "available" under CAP.
+- **P — Partition tolerance**: the system keeps working when the network arbitrarily drops messages between nodes.
+
+The theorem, proved by Gilbert and Lynch in 2002 after Brewer's 2000 conjecture, is that **in the presence of a partition you must sacrifice either consistency or availability**. It is not a menu of three where you pick two like toppings.
+
+The reason "pick two of three" is the wrong mental model: **P is not a choice you make, it is a property of reality.** Packets get dropped. Switches reboot. A GC pause looks like a partition to the other side. A cross-region link fails at 03:00 on a Saturday. You cannot choose "CA"; you can only choose what your system does *when* P happens. So the honest statement of CAP is:
+
+> **When a partition occurs, choose: refuse to answer (CP), or answer with possibly-stale data (AP).**
+
+And the second half of the modern understanding, which matters more in practice (Lesson 60): **partitions are rare; the trade-off you make every millisecond of every normal day is latency versus consistency.** CAP only describes the rare half.
+
+The one sentence to carry out of this lesson: **CAP is not a label you stick on a database, it is a decision you make per operation, per failure, about what a user sees when two machines disagree.**
+
+## 2. Why it exists
+
+Phases 1–3 built up a stack of statements that quietly contradicted each other, and CAP is the theorem that forces you to pick:
+
+- Lesson 32 taught replication: the same data on multiple machines.
+- Lesson 33 taught the trade-off: synchronous replication is slow but consistent; asynchronous is fast but a replica can be behind.
+- Lesson 34 taught replication lag: a user can update their profile and not see the change.
+- Lesson 55 taught that a read must return *a* value; it never asked *which* value.
+
+Now add a network fault. BookNook's `inventory` table is replicated to three nodes: `eu-west-1a`, `eu-west-1b`, `eu-west-1c`. A routing change partitions `1a` from `1b`/`1c`. A customer is on a connection routed to `1a` and buys the last copy of a book. Moments later another customer is routed to `1b` and tries to buy the same book.
+
+There is no clever engineering that resolves this. Only three possible behaviours:
+
+1. `1a` **refuses the write** because it cannot reach a majority. The first customer sees an error. **Consistent, unavailable.**
+2. `1a` **accepts the write locally** and reconciles later. Both customers are told they bought the last copy. **Available, inconsistent.**
+3. `1a` **waits** for the partition to heal before responding. From the user's perspective this is indistinguishable from (1) with a longer timeout — and CAP explicitly does not count waiting as availability.
+
+Every "distributed database" marketing page is describing which of these three it does, and under what conditions. The vendor's real answer is usually "1 for this operation, 2 for that one, and here is the knob". CAP is the vocabulary for reading those pages honestly.
+
+The reason the theorem exists at all is that the twentieth-century default was **a single node**, where all three properties were free: one machine is trivially consistent, available and "partition tolerant" (it has no network to partition internally). Scaling out — Phase 2's whole subject — buys throughput and fault tolerance with money borrowed against exactly these properties. CAP is the term sheet.
+
+## 3. Real-world analogy
+
+Two branches of a library that share a card catalogue, connected by a phone line.
+
+A member at the North branch borrows the last copy of a book. The North librarian must update the catalogue: mark it out. The South branch must know. Six options exist in reality, but only three classes:
+
+- **Phone-first**: North calls South and only completes the loan once South confirms its copy is updated. If the line is down, **North cannot lend the book at all**. Correct, and the member is turned away during an outage. (CP.)
+- **Local-first**: North marks its own catalogue and the member walks out with the book. If the line is down, South keeps lending the same copy to someone else, and the discrepancy is discovered when the line returns. Someone must decide who loses their book — or the library buys a second copy. (AP.)
+- **Wait-for-the-line**: North stands at the desk with the member until the line comes back. Nobody is served, but nothing is wrong. (Neither, with a bad user experience.)
+
+Now the observation that makes CAP practical rather than philosophical: **most of the time the line is up, and then phone-first costs almost nothing** — a few seconds at the desk. The interesting engineering question is not "which of the three are we?", it is **"how long is the phone call, and what happens to the member while it happens?"** That is PACELC (Lesson 60), and it is the question that decides whether a real system feels fast.
+
+And the final twist, which is the numeric heart of the matter: **a librarian cannot tell a slow phone line from a broken one.** If North waits 30 seconds and hears nothing, has South crashed, or is just busy? The decision to declare "partition" is a *timeout*, and a timeout is a guess. Every CAP decision in a real system is therefore implemented as a timeout, which means every CAP decision is occasionally wrong in the direction of the configured threshold (Lesson 16 on tail latency).
+
+## 4. Detailed technical explanation
+
+### 4.1 The precise statement, and what each letter excludes
+
+| Letter | Common misreading | Actual definition | What it is *not* |
+|---|---|---|---|
+| **C** | "ACID's C — constraints hold" | **Linearizability**: one logical copy, reads see the latest write | Not serializability (that is about transactions, multi-object), not "no constraint violations" |
+| **A** | "Fast, no downtime, meets SLO" | Every non-failed node returns a **non-error** response. **No latency bound** | Not a 99.99 % SLO, not p99 latency, not "always up" |
+| **P** | "We chose to be partition tolerant" | Arbitrary message loss between nodes is possible and the system continues operating | Not optional. Not a feature. It is the weather |
+
+Gilbert and Lynch's proof is small and worth understanding, because it also tells you the escape hatches. Model the system as two nodes, `G1` and `G2`, with a partition dropping all messages between them. A client writes `v1` to `G1` (it must succeed, or A is violated). A client then reads from `G2`. If `G2` responds, it cannot know about `v1` — no message can cross — so it returns something older, violating C. If `G2` refuses, A is violated. **QED.** Every escape hatch is an attack on one of the proof's assumptions:
+
+- **Make the client aware** → the client remembers `v1` and *sends* it with the read, or refuses to read from `G2`. This is what a "sticky session" or client-side monotonic read (Lesson 61) does.
+- **Make the partition impossible** (Spanner's TrueTime + synchronised clocks) → shrinks the window but does not remove it; Spanner still becomes unavailable during a partition, it just wins because GPS clocks make "partition" detectable as clock uncertainty.
+- **Make both writers agree on an order** (consensus, Lesson 81) → you still lose availability on the minority side, but you never lose consistency; this is the CP implementation.
+
+### 4.2 The three behaviours, concretely, in a 3-replica system
+
+Replication with `N = 3` replicas, and the classic knob: require a **quorum** of `W` acks to write and `R` acks to read (Lesson 80).
+
+| Setting | Write path | Read path | Partition behaviour | CAP label | Example systems |
+|---|---|---|---|---|---|
+| `W=3, R=1` | Wait for all 3 | Any 1 | Minority **cannot** write; reads may be stale-ish but consistent with the last acked write | **CP** (write side) | Synchronous PostgreSQL replicas |
+| `W=2, R=2` | Majority | Majority | Minority side (1 node) refuses both; majority continues. `W+R=4 > N=3` guarantees a read overlaps the latest write | **CP**, classic quorum | etcd, Consul, HBase, Cassandra at QUORUM |
+| `W=1, R=1` | Any single node, immediately | Any single node, immediately | Both sides accept writes independently; conflict resolution on heal | **AP** | Cassandra at ONE, DynamoDB eventually-consistent reads, Riak |
+| `W=1, R=3` | Fast writes | Slow, all-replica reads | Reads can be stale if a replica is behind, but `R=3` reads all and picks the newest | AP-ish with read repair | Cassandra at ONE/ALL |
+
+The inequality `W + R > N` is the whole of quorum consistency, and it is a CAP decision expressed as arithmetic: it forces at least one replica in the read set to have seen the write, so a successful read cannot return a value older than a successful write. Lower `W` and you gain write availability during a partition, at the cost of possible conflict on heal.
+
+### 4.3 What a partition actually does to requests
+
+The part that surprises people: a partition does not have to be a network split. Anything that makes a node unreachable for longer than a timeout is functionally a partition:
+
+```
+ Cause                              │ Looks identical to the other side as
+ ────────────────────────────────────┼──────────────────────────────────────
+ cable/switch failure               │ no response within the timeout
+ BGP route flap                     │ no response within the timeout
+ kernel dropping SYNs under load    │ no response within the timeout
+ a 40-second JVM GC pause           │ no response within the timeout
+ a hypervisor live-migration freeze │ no response within the timeout
+ the process being CPU-starved      │ no response within the timeout
+ a full TCP accept queue            │ no response within the timeout
+ ────────────────────────────────────┴──────────────────────────────────────
+```
+
+The last four are the dangerous ones, because they are *not* network faults, they correlate with load, and no monitoring dashboard labels them "partition". A GC pause long enough to trip the failure detector is a partition from the leader's point of view (Lesson 79), and the resulting unnecessary leader election is a well-documented cause of write unavailability in healthy clusters.
+
+### 4.4 Yields and harvests — the softer, more useful framing
+
+Brewer's earlier (1999, Harvest/Yield) framing is often more practical than CP/AP because it describes a *continuous* choice rather than a binary one:
+
+- **Yield** = fraction of requests answered successfully. (Availability.)
+- **Harvest** = fraction of the *complete* data reflected in an answer. (Consistency, measured.)
+
+A search over BookNook's catalogue with a partition can answer **100 % of queries with 60 % of the index** (high yield, partial harvest — "some results may be missing"), or answer **60 % of queries with 100 % of the index** (full harvest, lower yield). Real systems choose per query: a product page tolerates partial harvest; an inventory decrement does not. This is the same insight as "per-operation CAP", expressed in numbers you can put on a dashboard.
+
+### 4.5 Why "CA" is a category error (and when it isn't)
+
+You will see diagrams offering "CA databases". The label is only meaningful if you add "on a single node, or on a network you have proven cannot partition". A single PostgreSQL primary is effectively CA — because it is one node, and there is no *between* to partition. The moment you add a replica, you are in CP-or-AP territory and the "CA" label becomes a claim about your network, not your database.
+
+Two legitimate uses of the term:
+
+- **A single-node deployment** ("BookNook on one box, with backups") is CA, and that is not a criticism — it is the correct architecture for the vast majority of systems (Lesson 86).
+- **A cluster with a shared-nothing assumption violated** — e.g. nodes on the same switch with redundant power — is CA *up to the reliability of that infrastructure*. Still a claim, still needs a stated fault model.
+
+The test to apply to any "CA" claim: **what does it do when node 2 cannot reach node 1 for 60 seconds?** If the answer is "that never happens", that is an assumption, not a property.
+
+### 4.6 The two-meanings-of-consistency trap
+
+This trips up more interviews than anything else in the phase:
+
+| Term | Layer | Means |
+|---|---|---|
+| **ACID C** (Lesson 49) | Single database, single transaction | Constraints and invariants hold: no orphan rows, no negative stock, FKs valid |
+| **CAP C** | Distributed system, single object | **Linearizability**: reads see the latest completed write |
+| **Consistency models** (Lesson 61) | Distributed system, sessions | Weaker guarantees: causal, read-your-writes, monotonic reads, eventual |
+
+A system can be **ACID-consistent and CAP-inconsistent** — Cassandra with lightweight transactions is exactly this: per-row invariants hold, but reads can return stale data. Conversely, a system can be linearizable for one object and not another. When an interviewer says "consistent", always ask **which of the three**, and at what granularity.
+
+## 5. Request / data flow
+
+A partition, minute by minute, from BookNook's perspective. Three inventory replicas in `eu-west-1`; a network policy change isolates `1a`.
+
+```
+T+0:00  ── Nominal. Leader = 1a (Raft term 7). Writes go 1a → 1b,1c (majority).
+           Replication lag p99 = 4 ms. Everything is fine. Nobody is watching.
+
+T+0:00  ── Partition begins (1a unreachable from 1b/1c, and vice versa).
+
+T+0:00  Request A: "decrement stock of ISBN 978-… from 3 to 2"
+           → routed by the load balancer to the LEADER 1a
+           → 1a appends to its log, tries to replicate to 1b,1c
+           → no response. It cannot commit (needs a majority of 3).
+           → after the 500 ms election/ack timeout: REJECTS the write.
+           → Customer sees "please try again" — a 503.
+           → 1a steps down from leadership (it can no longer prove it is leader).
+
+T+0:01  ── 1b and 1c elect a new leader (1b, term 8) after their own timeout.
+           They are a majority (2 of 3) and they continue serving.
+
+T+0:02  Request B: same ISBN, different customer, routed to 1b
+           → 1b is now leader, stock is 3 (1a's write never committed)
+           → accepted, committed to 1b+1c → stock = 2. Answered OK.
+
+T+0:03  Request C: a READ of stock for that ISBN, routed to 1a
+           → 1a still believes it is a follower in term 7 with stock = 3
+           → a CP system REJECTS the read (cannot confirm leadership freshness)
+           → an AP system would answer "3", which is stale.
+
+T+0:30  ── Partition heals.
+           → 1a rejoins, learns of term 8, truncates its uncommitted log entry.
+           → Synchronises. Stock = 2. All three replicas agree again.
+           → Total user impact: ~40 requests in 30 s got 503s on 1a.
+             ZERO double-sells. Availability cost, consistency preserved.
+
+T+0:30  ── The alarm fires. Incident review asks the CAP question:
+           "we chose CP for 30 seconds; our SLO budget for the month was
+            26 minutes; we spent 30 seconds of it; the choice was correct."
+```
+
+Change one design decision — set `W = 1` so a lone node can accept writes — and the same timeline produces **two customers told they bought the last copy**, at `1a` and `1b`, with the conflict resolved (arbitrarily, usually last-write-wins) on heal. That is the AP branch: 100 % availability during the partition, and a business problem afterwards. **Neither is wrong in general; one is wrong for inventory.**
+
+## 6. ASCII diagram
+
+The Gilbert–Lynch scenario, drawn:
+
+```
+              ┌──────────── PARTITION (all packets dropped) ────────────┐
+              ╳                                                          ╳
+      ┌───────┴────────┐                                    ┌────────────┴───────┐
+      │   Node G1      │                                    │   Node G2          │
+      │  stock = 3     │                                    │  stock = 3         │
+      └───────┬────────┘                                    └────────────┬───────┘
+              │                                                          │
+      ┌───────┴────────┐                                    ┌────────────┴───────┐
+      │ Client 1       │                                    │ Client 2           │
+      │ buy last copy  │                                    │ buy last copy      │
+      └────────────────┘                                    └────────────────────┘
+
+  MUST choose one of these three outcomes for Client 2:
+
+  (1) CP ─ refuse   ─→ "503, try again"          0 double-sells, 1 lost sale
+  (2) AP ─ accept   ─→ "order confirmed"         1 double-sell, 0 lost sale
+  (3) wait          ─→ hang until heal           both users time out;
+                                                   CAP counts this as (1)
+```
+
+The choice matrix as a decision tree you can actually apply:
+
+```
+             Does this operation tolerate a stale read?
+                        │
+          ┌─────────────┴──────────────┐
+         YES                           NO
+          │                             │
+     Can the user be told             Is a single authoritative
+     "some data is missing"?          owner for this item possible?
+          │                             │
+    ┌─────┴─────┐                 ┌─────┴──────┐
+   YES         NO                YES          NO
+    │           │                 │            │
+  AP with     AP with          CP: route     You need a
+  partial     last-write-wins  all writes    coordination
+  harvest     (product views,  to the owner  service
+  (search,    (profile bio,    (inventory,   (consensus,
+  reviews,    likes, presence) seats, money)  Lesson 81)
+  catalogue)                                  or a business
+                                              process that
+                                              tolerates conflict
+```
+
+Notice the right-hand branch: **CP is not "use a CP database", it is "one owner, and everyone else asks it"**. Most CP systems in production are a single-writer pattern (a primary, a shard leader, a partitioned Kafka topic) rather than a quorum protocol.
+
+## 7. Detailed example
+
+### 7.1 BookNook's split — the same system, four different CAP decisions
+
+BookNook runs one primary database and a handful of specialised stores. It is not "a CP system" or "an AP system"; it makes four different decisions:
+
+| Feature | Store & setting | CAP choice during partition | Why |
+|---|---|---|---|
+| **Stock decrement at checkout** | PostgreSQL, synchronous standby + quorum read | **CP** — refuse rather than double-sell | A double-sell is a refund, an angry email, and a support ticket. A 503 is a retry. The asymmetry is enormous. |
+| **Product page render** | Redis cache-aside over replicas, 60 s TTL | **AP** — serve possibly-stale price/description | A 60-second-stale price is invisible to 99.9 % of users; a broken product page is a lost sale. |
+| **Customer reviews** | Cassandra-ish, `W=1, R=1`, LWW | **AP** — accept both, reconcile later | Two reviews from the same person during a partition is a curiosity, not a corruption. |
+| **Password change / session revocation** | Primary only, no replica reads, fail closed | **CP** — reject the login | Serving a revoked-token session is a security incident; failing a login is an inconvenience. |
+
+The transferable pattern: **the CAP decision is a property of the *operation's business risk*, not of the database vendor.** Same cluster, four answers. Any architecture diagram that labels the whole system "CP" is hiding the only interesting information in it.
+
+### 7.2 The 30-second partition that used the month's error budget
+
+Numbers, because this is where CAP becomes an operational decision rather than a philosophical one.
+
+- BookNook's SLO: **99.95 %** of checkout requests succeed, measured monthly.
+- Monthly error budget: `30 days × 24 h × 60 min × 0.0005 = 21.6 minutes`.
+- A 30-second partition on the checkout path (CP branch: refuse) consumes `0.5 min / 21.6 min = 2.3 %` of the budget. Fine. Two of those a week is `~4.4 min/month = 20 %` of the budget — still acceptable, and now you know *why* the CP choice is affordable.
+- A 30-**minute** partition consumes **139 %** of the entire month's budget in one event. That is not a CAP problem, that is a topology problem: it means a single switch failure or a single AZ link can isolate a majority, and the fix is to spread replicas across failure domains (Lesson 39) so that "a majority" survives any single failure.
+
+The arithmetic you should say out loud in an interview: **CP is affordable exactly when partitions are shorter than your error budget divided by your expected partition frequency.** When that inequality fails, you either reduce partition duration (topology, faster failure detection — but faster detection risks false positives, Lesson 79) or you move that operation to AP and handle the conflict in business logic.
+
+### 7.3 The Spanner exception, briefly
+
+Google Spanner is the standard counter-example thrown at CAP: it claims external consistency (stronger than linearizability) *and* high availability. It does this by attacking the proof's assumption that nodes cannot know the ordering of events — with **TrueTime**, GPS and atomic clocks that bound clock uncertainty to a few milliseconds. A write waits out the uncertainty (`commit-wait`), typically **7 ms**, which is a latency cost paid on every write, in normal operation, forever.
+
+This is worth understanding precisely because it does not refute CAP — it *illustrates PACELC*: Spanner chose **PC/EC** (consistent, and pays latency even with no partition). During an actual partition, Spanner still becomes unavailable on the minority side, exactly as CAP requires. The lesson: **you can buy your way out of a consistency problem with hardware and latency, but not out of CAP.**
+
+## 8. Code or configuration example
+
+```sql
+-- ============================================================================
+-- BookNook: the CAP decision, expressed as configuration. Illustrative.
+-- Each block is ONE decision, taken from §7.1. The comment states what
+-- happens during a partition — that is the only thing that matters.
+-- ============================================================================
+
+-- --- 1. CHECKOUT: CP. Never double-sell, even at the cost of an outage. ------
+-- PostgreSQL synchronous replication with a quorum of standbys.
+-- postgresql.conf on the primary:
+--   synchronous_standby_names = 'ANY 1 (eu-west-1b, eu-west-1c)'
+--   synchronous_commit        = 'on'          -- default; see Lesson 49 §durability
+--   statement_timeout         = '2s'
+-- Behaviour during a partition: if no standby in the set is reachable, COMMIT
+-- BLOCKS and then fails. Writes rejected. That is the intended CP behaviour:
+--   - the replica in the OTHER AZ must ack before we tell the customer "yes".
+--   - RPO = 0 for acknowledged commits (Lesson 63).
+-- The cost is exposed write latency: p99 goes from 3 ms local to ~6 ms
+-- cross-AZ. That is the price of CP, paid on every single order, forever.
+
+BEGIN;
+  UPDATE inventory
+     SET reserved = reserved + 1
+   WHERE isbn = '978-0-00-000000-0'
+     AND reserved < stock_on_hand        -- the invariant, enforced in the WHERE
+  RETURNING reserved;
+  -- Zero rows returned = sold out. Not an error: a legitimate business answer.
+  -- Row-level locking means the second concurrent buyer blocks, then re-reads
+  -- and finds reserved = stock_on_hand. Correctness from the database, not
+  -- from a distributed lock (Lesson 78).
+COMMIT;
+
+
+-- --- 2. PRODUCT PAGE: AP. A stale price beats a blank page. -------------------
+-- App-level cache-aside against read replicas. In the client:
+--   GET product:{isbn}          -> Redis, TTL 60s
+--   miss -> replica (may lag)   -> tolerate up to 60s staleness
+--   on replica error            -> serve the last cached value, with a
+--                                  "prices may have changed" banner
+-- Behaviour during a partition: the read path NEVER 503s while any cache or
+-- replica responds. Staleness bound is explicit: 60 s TTL + replication lag.
+-- If the price is legally binding at checkout, the checkout path re-reads it
+-- from the primary inside the transaction — the CAP decision is per operation.
+
+-- Cassandra equivalent for the reviews table (AP, tunable):
+--   CREATE TABLE reviews_by_book (... PRIMARY KEY (isbn, review_id))
+--     WITH replication = {'class':'NetworkTopologyStrategy',
+--                         'eu-west-1': 3, 'us-east-1': 3};
+--   -- Write: consistency ONE   -> survives losing 2 of 3 local replicas
+--   -- Read : consistency QUORUM -> may re-join an unreplicated write later
+--   -- Conflict resolution: last-write-wins on a server-side timestamp.
+--   --   This is an explicit decision that two concurrent edits to the SAME
+--   --   review will silently lose one. Acceptable for reviews. NOT for stock.
+
+
+-- --- 3. QUORUM ARITHMETIC AS A GUARD, not a comment --------------------------
+-- The invariant W + R > N is what makes a quorum read consistent. Assert it
+-- in application startup code so a config change cannot silently break it:
+SELECT CASE
+         WHEN 2 + 2 > 3 THEN 'ok: read quorum overlaps write quorum'
+         ELSE 'BROKEN: stale reads possible (AP, not CP)'
+       END AS quorum_check;
+-- Change W to 1 and this starts returning 'BROKEN' — which is exactly the
+-- moment someone must consciously accept AP for that table.
+
+
+-- --- 4. THE DECISION MUST OUTLIVE THE MEETING ---------------------------------
+-- Put it in the schema, where a future engineer will trip over it.
+COMMENT ON TABLE inventory IS
+  'CAP: CP during partitions. Writes require a synchronous standby in a
+   different AZ; the API returns 503 rather than risk a double-sell.
+   Owner: checkout team. Reviewed: 2026-10. See ADR-014.';
+COMMENT ON TABLE reviews_by_book IS
+  'CAP: AP. LWW on server timestamp. Duplicate/lost concurrent edits to the
+   same review are accepted; the page tolerates eventual convergence.';
+```
+
+## 9. Numerical example
+
+**Step 1 — the availability you actually get from a CP choice.**
+
+Three replicas across three AZs, `W=2`. A partition isolates one AZ (the common case):
+
+```
+Reachable replicas: 2 of 3  →  2 >= W=2  →  MAJORITY SURVIVES
+Writes continue. Reads continue. User-visible impact: ZERO.
+```
+
+A partition isolates two AZs (rare — usually a regional control-plane fault):
+
+```
+Reachable replicas: 1 of 3  →  1 < W=2  →  NO MAJORITY
+All writes rejected for the duration. This is the CP outage window.
+```
+
+**Step 2 — putting a number on the risk.** AZ-level partition probability, from typical cloud incident data, is on the order of **1 event per AZ-pair per 2–3 years**, lasting **5–45 minutes**. Say 0.4 events/year and 20 minutes each:
+
+```
+Expected unavailable minutes per year (single-AZ isolation, survived): 0
+Expected unavailable minutes per year (dual-AZ isolation):  ~0.02 events/yr × 20 min ≈ 0.4 min/yr
+Availability attributable to partitions ≈ 1 - 0.4 / 525,600 ≈ 99.9999 %
+```
+
+Which tells you something important: **on a well-designed topology, CAP-driven unavailability is not what determines your availability.** Your 99.95 % SLO will be consumed by deploys, bad queries, dependency latency and traffic spikes (Phase 4, Lesson 89) long before by partitions. This is the quantitative case for the phase-4 ordering: partitions get the theory, bad deploys get the on-call rota.
+
+**Step 3 — the price of CP on every request.** Checkout write to a local primary: **3 ms**. With `synchronous_standby_names = 'ANY 1 (...)'` in another AZ, add one cross-AZ round trip: **+1.5 ms**. So:
+
+```
+p50 checkout write:  3 ms  →  4.5 ms
+p99 (cross-AZ tail): 9 ms  → 14 ms
+```
+
+At 40 checkout writes/sec, that is `40 × 1.5 ms = 60 ms` of extra wait per second — invisible. At 4,000 writes/sec it is `6 seconds of wait per second` spread across in-flight requests, and the *concurrency* needed to sustain throughput rises by 1.5 ms's worth per request (Little's Law, Lesson 14): `4,000 × 0.014 = 56 in-flight` versus `4,000 × 0.009 = 36`. **CP is nearly free at low write rates and expensive at high ones** — which is precisely why write-heavy systems drift toward AP or toward partition-tolerant-but-asynchronous designs (Lesson 33).
+
+**Step 4 — the cost of getting it wrong.** Suppose BookNook had chosen AP for inventory (`W=1`). During the same 30-second partition, both sides accept writes. Modelled oversell rate: 40 writes/sec × 30 s = 1,200 accepted writes, of which the conflicting fraction is the fraction of orders for **the same ISBN at low stock**. BookNook's long tail means ~3 % of orders hit a title with <5 copies remaining, and ~10 % of those concurrently during the window:
+
+```
+conflicts ≈ 1,200 × 0.03 × 0.10 ≈ 3.6 double-sells per 30-second partition
+```
+
+Four customers told "you bought the last copy" out of a book that never existed. Each resolves as a refund + apology + support cost, and the trust damage is disproportionate to the number. **Three point six double-sells per event is the entire argument for paying 1.5 ms on every write.**
+
+## 10. Trade-offs
+
+| Choice | Buys you | Costs you | Use it for |
+|---|---|---|---|
+| **CP — quorum/leader, refuse on minority** | No conflicting writes; no reconciliation logic; a single source of truth | 503s during partitions; extra write latency for every commit; sensitivity to false-positive failure detection | Money, inventory, seats, unique identifiers, auth |
+| **AP — accept everywhere, reconcile later** | Writes never fail; lowest write latency; locality | Conflict resolution is now *your* code; some conflicts are unresolvable; users can see stale data | Reviews, likes, presence, carts, view counts, telemetry |
+| **AP with LWW timestamps** | Trivial to implement | Silently discards the "loser" of a conflict — including real user edits; clock skew makes "last" arbitrary (Lesson 66) | Data where one writer dominates or loss is acceptable |
+| **CP with a single owner per shard** | Simple mental model; strong consistency; cheap in the normal case | Ownership failover is the hard part (Lesson 79); hot shard = hot owner | Per-entity ordering (orders per customer, queue per partition) |
+| **Tunable per operation** | You pay for exactly what you need | Configuration surface is a foot-gun; `W+R>N` can be broken by a well-meaning tweak | Most real systems — but only with the invariant asserted in code |
+| **Avoid the problem (idempotent, commutative operations)** | No conflict at all: order of application does not matter | Requires careful data modelling (counters, CRDTs); not always possible | Counters, sets, append-only logs, "add to cart" |
+| **Choose CA (single node)** | The strongest properties, cheapest | No fault tolerance beyond one machine; a hard limit on scale | Anything under ~10k writes/sec with a good backup story |
+
+## 11. Failure scenarios
+
+**11.1 — Assuming partitions do not happen because "we're in one region".** A single-AZ deployment with a synchronous replica in the same rack: the top-of-rack switch fails and both "replicas" vanish together. The fault model was never written down, so nobody noticed the replicas shared a failure domain. **Symptom:** a total outage from a component you believed was redundant. **Fix:** name your failure domains explicitly (host, rack, AZ, region) and require each replica to differ from its peers in the highest domain you claim to survive.
+
+**11.2 — CP everywhere, including where nobody cares.** A team makes the session cache a consensus-replicated store. Now every page view depends on a quorum round trip, and a partition logs users out. **Symptom:** availability that is strictly worse than the SLO for no user-visible benefit. **Fix:** the §4.4 harvest/yield question per operation. Sessions are AP: a sticky cookie and a cache are enough.
+
+**11.3 — AP under a business invariant.** "We'll reconcile stock later" works for page views and fails for inventory. Discovered only when the reconciliation job writes a negative stock row and the CHECK constraint rejects it at 02:00. **Symptom:** constraint violations surfacing days after the partition, from a job nobody associates with availability. **Fix:** classify operations by *whether a conflict is resolvable* before choosing AP; if the answer is "no", you needed CP or a compensating business process (Lesson 84).
+
+**11.4 — The false-positive partition.** A 12-second GC pause trips the 10-second failure detector. The leader is deposed, a new leader is elected, and the old leader returns — believing it still leads — and accepts writes. Without **fencing tokens** or term numbers enforced at the storage layer, both write. **Symptom:** split-brain writes with no network fault ever recorded. **Fix:** monotonic fencing tokens checked by the resource being protected (Lesson 78), not by the lock service.
+
+**11.5 — Clock skew corrupting the LWW resolution.** Two AP writes resolved by "latest timestamp wins" pick the wrong winner because node A's clock is 900 ms ahead. The user's edit disappears and reappears as the old value. **Symptom:** "it randomly reverts my changes". **Fix:** do not use wall clocks for ordering (Lesson 66); use logical versions, or don't resolve — merge (CRDTs).
+
+**11.6 — Partition durations nobody measured.** The incident review says "the partition lasted 4 minutes" because that is when alerts fired. The actual user impact started when the first request timed out, which was 40 s earlier. **Symptom:** SLO breaches that do not reconcile with incident timelines. **Fix:** measure at the **request** level (checkout success rate by minute), not the infrastructure level.
+
+**11.7 — Reading CAP as a per-vendor label.** An architecture review concludes "we're a Cassandra shop, so we're AP" and the inventory table gets `W=1` by inheritance. **Symptom:** the §9 step 4 double-sell. **Fix:** the decision belongs in the schema (§8.4 `COMMENT ON TABLE`), reviewed like any other invariant.
+
+## 12. Alternatives
+
+| Instead of reasoning about CAP | You get | When it is right |
+|---|---|---|
+| **PACELC (Lesson 60)** | The other 99.99 % of the time: latency vs consistency with no partition at all | Always — it is the strictly more useful framework, and it subsumes CAP |
+| **Explicit consistency models (Lesson 61)** | Per-session guarantees (read-your-writes, monotonic reads) users can actually feel | Session-scoped data, UX-driven consistency |
+| **Consensus (Lesson 81)** | A concrete CP implementation: a replicated log with a leader | Metadata, configuration, leader election, small critical state |
+| **Quorums with `W+R>N` (Lesson 80)** | Tunable CP/AP per operation | Large data, multi-DC, latency-sensitive |
+| **CRDTs / commutative operations** | Conflict-free AP: no reconciliation needed | Counters, sets, presence, collaborative editing (with limits) |
+| **Idempotency keys (Lesson 17, 74)** | Makes retries safe, sidestepping the ambiguous-outcome branch of CAP | Any write that follows a timeout |
+| **Single-writer per shard** | The simplest CP: one owner, everyone asks | The default for most business data |
+| **Business compensation (Lesson 84)** | Turns a consistency problem into a workflow problem | Reservations, bookings, multi-step purchases |
+
+## 13. When to use it
+
+- **In every design interview and design doc** that includes replication, multi-region, or more than one data store. One line: "this operation is CP during partitions because X; that one is AP because Y."
+- **When choosing a consistency level or replication mode** — `QUORUM` vs `ONE` is a CAP decision, and the setting should be justified, not inherited.
+- **When a dependency becomes a distributed system.** Adding a replica, a cache, a second region or a message broker all introduce the C/A choice; adding it silently is the common failure.
+- **When writing the incident runbook.** "What should on-call do when the database reports no quorum?" has a different answer under CP and AP, and the answer should be pre-decided.
+- **When someone proposes "just make it strongly consistent"** — that is a request for latency and availability costs, and CAP is how you make them explicit.
+
+## 14. When *not* to use it
+
+- **As the primary framework for reasoning about latency.** CAP says nothing about the normal case. Use PACELC (Lesson 60) or you will optimise for a rare event and ship a slow product.
+- **To label an entire system.** CAP applies to a **single operation on a single data item**. "Is BookNook CP?" is not a well-formed question; "is checkout's stock decrement CP?" is.
+- **To justify a vendor choice.** "We need AP, so Cassandra" skips the actual requirements and usually leads to the §11.3 failure.
+- **When there is no replication.** One node has no partition to survive; spending a design review on CAP there is theatre.
+- **To argue that consistency is optional.** AP still requires you to define the staleness bound and the merge rule. "Eventually consistent" is a design, not an excuse.
+- **As a substitute for idempotency.** CAP tells you the write may be ambiguous; it does not make the retry safe (Lesson 17).
+
+## 15. Common mistakes
+
+1. **"Pick two of three."** P is mandatory, so the choice is binary and only during a partition. Saying this in an interview is an instant credibility loss.
+2. **Confusing CAP's C with ACID's C.** Linearizability versus constraint integrity. Different layer, different meaning (Lesson 49).
+3. **Reading A as uptime or SLO.** CAP's A has no latency bound; a system answering in 30 s is "available". Latency lives in PACELC.
+4. **Calling a system CA without stating a fault model.** "CA" is a claim about your network, not your database.
+5. **Choosing AP for data with unresolved conflicts.** Inventory, money, seats, unique usernames.
+6. **Choosing CP for data with no business invariant.** Sessions, presence, view counts — you are buying outages you do not need.
+7. **Forgetting that partitions include GC pauses and overload.** Any unresponsiveness longer than the failure-detector timeout is a partition.
+8. **Resolving conflicts with wall-clock timestamps.** Skew makes LWW arbitrary; use versions or merge (Lesson 66).
+9. **Tuning `W`/`R` without asserting `W+R>N`.** A single-config-change AP regression is very common.
+10. **Never measuring partition duration or frequency**, so the CP trade-off is never priced against the error budget.
+11. **Believing Spanner refutes CAP.** It pays latency on every write and still goes unavailable on a minority — which is the theorem, not an exception.
+12. **Not writing the decision down.** Six months later a new engineer flips a consistency level and nobody can tell whether the old value was load-bearing.
+
+## 16. Interview perspective
+
+**What is actually being tested.** Two things. First, whether you know CAP **precisely** — the definitions, the fact that partition tolerance is not optional, and that the choice is per-operation. Second, and much more important, whether you can **turn the theorem into a design decision with a cost**: which of my operations are CP, what does the user see during a partition, and how long can that last before it breaks my SLO?
+
+**Answers that land well:**
+
+- *"Is your system CP or AP?"* — "Neither as a whole. Checkout's stock decrement is CP — a synchronous standby and a 503 rather than a double-sell — because a double-sell costs far more than a retry. Product pages and reviews are AP with an explicit 60-second staleness bound. The decision is per operation and it's written in the schema comments so it survives staff turnover."
+- *"What happens to BookNook during a network partition?"* — "Depends which partition. One AZ isolated: nothing — `W=2` of 3 still has a majority, so writes continue. Two AZs isolated: writes on the minority are rejected, reads served from replicas continue, and the checkout SLO absorbs it. The 30-second version of that event costs 2.3 % of the monthly error budget, which is why I'm comfortable with CP there."
+- *"Why not just be consistent everywhere?"* — "Because consistency is a latency bill paid on every write and an availability bill during partitions. For reviews, both bills buy nothing. For inventory, both are cheap relative to the alternative. That asymmetry, not the theorem, is the design."
+- Raising **PACELC unprompted** — "and that's the partition case, which is rare; the everyday trade-off is latency versus consistency, which is what actually sets our p99" — signals you have read past the undergraduate version.
+
+**Common interview tasks:** given a system, classify each operation CP or AP and justify it; explain what happens to a write during a partition; choose between `QUORUM` and `ONE` for a given request; explain why "CA" is a category error; reconcile "the database is consistent" with "the user sees stale data"; compute the availability cost of a sync replica.
+
+**Red flags interviewers watch for:**
+
+- "Pick two of three."
+- Defining C as "ACID consistency" or A as "uptime".
+- Treating CAP as a property of a product rather than of an operation.
+- Choosing AP for a money or inventory path without mentioning reconciliation or compensation.
+- Choosing CP everywhere and not noticing the availability cost.
+- No mention of timeouts — every CAP decision is implemented as a timeout, and timeouts are guesses.
+- Being unable to say what the *user* experiences during a partition.
+- Claiming Spanner proves CAP wrong.
+- Never mentioning that partitions are rare, which means never mentioning PACELC or latency.
+
+## 17. Knowledge check
+
+**Conceptual**
+
+1. State CAP precisely, including the formal meaning of each letter. Then explain why "partition tolerance is not optional", and why the practical form of the theorem is "during a partition, choose C or A".
+2. Explain the difference between **CAP consistency** and **ACID consistency**, and construct a concrete system that is ACID-consistent but CAP-inconsistent (state the operation, the invariant, and the anomaly a user could observe).
+3. A colleague says "we run Cassandra, so we're AP and we don't need to worry about conflicts". Correct them precisely: name the knob that changes the answer, the guarantee that knob provides when set to `QUORUM`, and the specific class of data for which their statement is dangerous.
+
+**Practical scenario**
+
+4. BookNook is adding a "reserve at checkout, pay within 15 minutes" flow. Inventory must never go negative; the reservation must be visible to the user immediately on the checkout page, and the "X left in stock" badge on product pages may be up to a minute stale. There are three replicas in three AZs, and a partner integration that reads stock via API. Specify the CAP decision for each of the four interactions (reserve, user's own reservation view, product-page badge, partner API read), the replication settings, the behaviour during a single-AZ partition and during a dual-AZ partition, and the one measurement that would tell you whether your choice is affordable.
+
+**Calculation**
+
+5. An SLO requires 99.99 % monthly availability for checkout. (a) Compute the monthly error budget in minutes. (b) A CP design rejects writes during any partition that leaves fewer than 2 of 3 replicas reachable; if dual-AZ isolations occur 0.05 times per month and last 8 minutes on average, what fraction of the budget do they consume? (c) If single-AZ isolations (which the design survives) occur 1.5 times per month but each takes 45 s to *detect* and the design stalls writes during detection, what fraction of the budget does detection latency consume? (d) State whether the design meets the SLO, and the single change you would make if it did not.
+
+6. A three-replica store is configured `N=3`. For each of (`W=2,R=2`), (`W=1,R=1`), (`W=3,R=1`), state (a) whether `W+R>N` holds, (b) the maximum number of replicas that can be lost while still accepting writes, (c) the maximum number that can be lost while still serving reads, and (d) the CAP behaviour during a partition that isolates exactly one replica and, separately, two replicas.
+
+**Progress checklist**
+
+- Phase 1 — Foundations (Lessons 1–17): **complete** ✅
+- Phase 2 — Scaling (Lessons 18–39): **complete** ✅
+- Phase 3 — Data and Storage:
+  - [x] Topic 1 — Relational databases (L40)
+  - [x] Topic 2 — Tables, keys, relationships, joins, constraints (L41)
+  - [x] Topic 3 — SQL versus NoSQL (L42)
+  - [x] Topic 4 — Key-value databases (L43)
+  - [x] Topic 5 — Document databases (L44)
+  - [x] Topic 6 — Wide-column databases (L45)
+  - [x] Topic 7 — Graph databases (L46)
+  - [x] Topic 8 — Search engines and full-text indexes (L47)
+  - [x] Topic 9 — Selecting a database from access patterns (L48)
+  - [x] Topic 10 — ACID transactions (L49)
+  - [x] Topic 11 — Isolation levels (L50)
+  - [x] Topic 12 — Dirty/non-repeatable/phantom reads, lost updates (L51)
+  - [x] Topic 13 — Optimistic versus pessimistic concurrency control (L52)
+  - [x] Topic 14 — Database indexes (L53)
+  - [x] Topic 15 — B-tree, hash, composite, covering, secondary indexes (L54)
+  - [x] Topic 16 — Query plans and index trade-offs (L55)
+  - [x] Topic 17 — Normalisation and denormalisation (L56)
+  - [x] Topic 18 — OLTP versus OLAP (L57)
+  - [x] Topic 19 — Data warehouses, data lakes, lakehouses (L58)
+  - [x] **Topic 20 — CAP theorem (L59) ← you are here**
+  - [ ] Topic 21 — PACELC (L60)
+  - [ ] Topic 22 — Consistency models (L61)
+  - [ ] Topic 23 — Object, block, and file storage (L62)
+  - [ ] Topic 24 — Data retention, archival, backups, disaster recovery (L63)
+
+**NEXT LESSON: Phase 3, Topic 21 — PACELC**
+
+---
+
 # Lesson 60 — PACELC
 
 *Phase 3, Topic 21*
@@ -3532,6 +4069,707 @@ This topic appears in almost every file-upload, media, or backup design question
 
 **NEXT LESSON: Phase 3, Topic 24 — Data retention, archival, backups, and disaster recovery**
 
+
+---
+
+# Lesson 63 — Data Retention, Archival, Backups, and Disaster Recovery
+
+*Phase 3, Topic 24*
+
+## 1. Simple definition
+
+Four ideas that are constantly confused, and that must be separate:
+
+- **Retention**: *how long* you keep data, and *why*. A written rule — "orders for 7 years because tax law, clickstream for 30 days because nothing reads it, deleted-account data for 30 days because GDPR lets us" — with an owner and a deletion mechanism.
+- **Archival**: *moving* data that must be kept but is rarely read onto cheaper, slower media. The data is still yours and still retrievable; it is just not on the fast disk any more.
+- **Backup**: an **independent, restorable copy** of your data, taken at a point in time, stored such that a failure of the primary cannot destroy it. Its only purpose is to answer: *can I reconstruct the exact state of this database as of a specific instant?*
+- **Disaster recovery (DR)**: the *plan and topology* that gets the service running again after losing a site, a region, or an account — including the parts a database backup does not cover: DNS, secrets, configuration, the deployment pipeline, and the knowledge of the humans involved.
+
+And the two numbers that make all four measurable:
+
+- **RPO (Recovery Point Objective)**: the maximum amount of data you are willing to lose, expressed as **time**. "RPO = 5 minutes" means a disaster may cost you the last 5 minutes of writes.
+- **RTO (Recovery Time Objective)**: the maximum time to restore service. "RTO = 1 hour" means users may be down for an hour.
+
+Both are **business decisions**, not engineering ones. Engineering's job is to price them: an RPO of 24 hours is nearly free, an RPO of 5 seconds costs a synchronous standby and its latency on every commit, and an RPO of zero across regions costs you your write latency budget entirely.
+
+The one sentence to carry out of this lesson: **replication saves you from hardware; backups save you from yourself — and only one of those two failures actually happens regularly.**
+
+## 2. Why it exists
+
+Lesson 32 taught replication and everyone leaves that lesson believing they are safe. They are not, and the reason is a single sentence: **a replica applies the same changes the primary does, in the same order, including the wrong ones.**
+
+- Someone runs `DELETE FROM orders WHERE customer_id = 4821` without the `WHERE` clause in a transaction they then commit. The primary did it; the replica did it **11 milliseconds later**. Both are wrong, identically and instantly.
+- A migration drops a column. Replicated.
+- A ransomware binary encrypts the files. Replicated.
+- A code bug writes `total_pence = 0` for every order in a date range. Replicated.
+- Someone drops the table. Replicated.
+
+Replication has an RPO of milliseconds and is **useless for every one of those five failures**, because its purpose is to keep a copy of *the current state* — and the current state is exactly what is now wrong. Only a **point-in-time** copy taken *before* the mistake lets you go back. That is what a backup is, and the distinction is the most important sentence in the phase for anyone who has ever been on call.
+
+The second reason this lesson exists is that backups are a **legal and financial** artefact, not just an operational one. BookNook has to keep order records for seven years (tax), delete marketing data on request within 30 days (data protection), keep a copy of nothing that a court has placed a hold on, prove the deletion happened, and do all of it while the primary database is 1.2 TB and growing 4 GB/day. Retention is where storage engineering meets compliance, and getting it wrong is a fine rather than an outage.
+
+Third: cost. BookNook's 1.2 TB database, kept forever on fast replicated storage, is a line item that grows monotonically. Archival is how you keep the obligation without keeping the cost — **the data must exist; only the access path may be slow.**
+
+## 3. Real-world analogy
+
+Two accountants, and the difference between them is the entire lesson.
+
+**The first accountant is a mirror.** Whatever you write in your ledger, they write in theirs, within a second, always in perfect agreement. This is replication, and it is genuinely valuable: if your ledger burns, theirs is up to date. But now suppose that on Tuesday you accidentally post a ₹40 lakh payment twice and only notice on Friday. The mirror has the same mistake, twice, on the same dates. **A mirror cannot tell you what the ledger said on Thursday.** Agreement is not the same as history.
+
+**The second accountant photographs the ledger every night at midnight**, stores the photographs in a vault in a different city, and every quarter takes one out and does a full reconciliation to prove the photograph is legible and complete. This is a backup. It is 24 hours out of date at worst (its **RPO**), it takes hours to recover from (its **RTO**), and it is the only thing that can tell you what Monday looked like.
+
+**Archival** is what happens to the 2014 ledgers: they move from the shelf behind the desk to the basement, then to off-site storage. Still yours, still retrievable, no longer in the way. The mistake people make is thinking "in the basement" means "gone" — a retrieval that takes 12 hours has changed your RTO, not your retention.
+
+The quarterly reconciliation (**a restore drill**) is the part everybody skips, and it is the part that matters. An unphotographed snapshot is a rumour; a photograph nobody has ever opened is a *hope*. There is a well-known saying in the field — **"nobody has a backup strategy; they have a restore strategy, or they have an outage"** — and this lesson is mostly about making the restore real.
+
+## 4. Detailed technical explanation
+
+### 4.1 The taxonomy, with the distinction that actually matters
+
+| Type | What it is | Restore granularity | Typical RPO | Typical RTO | BookNook use |
+|---|---|---|---|---|---|
+| **Logical dump** (`pg_dump`, `mysqldump`) | SQL text or custom-format stream of schema + rows | Down to one table or one row (with work) | Hours to a day | Hours (slow: index rebuild) | Small databases, cross-version migrations, per-table rescue |
+| **Physical base backup** (`pg_basebackup`, `pgBackRest`, `XtraBackup`) | Byte-level copy of the data directory + WAL start point | Whole cluster, then PITR | Minutes (continuous WAL) | 30 min – 2 h for ~1 TB | **The real primary backup** |
+| **Continuous WAL archiving** | Every 16 MB WAL segment shipped somewhere durable | Any instant, to the transaction | ~0 (or `archive_timeout`) | adds replay time | The component that makes PITR possible |
+| **Filesystem / volume snapshot** (EBS, ZFS, SAN) | Copy-on-write block image, near-instant to *take* | Volume | Seconds | Minutes to mount, but **crash-consistent only** | Fast rollback before risky migrations |
+| **Managed PITR** (RDS, Cloud SQL, Aurora) | Vendor runs base backups + WAL for you | Whole instance, to the second | ~5 min (or 0 with sync) | 20 min – hours | Almost always worth it |
+| **Replica** | Live copy of current state | N/A | ~0 (sync) or seconds (async) | Seconds (promote) | Availability, not recovery |
+
+Two rows in that table are the ones people get wrong:
+
+- **A snapshot is not a backup.** It is crash-consistent: the filesystem image is as consistent as a power-cut would leave it, which a database recovers from — but the snapshot is usually stored **in the same account and often the same region** as the volume. A compromised account or a regional control-plane failure takes both.
+- **A replica is not a backup**, for the five reasons in §2.
+
+### 4.2 Point-in-time recovery: how "go back to 14:01:59" actually works
+
+PITR is the single most valuable capability here, and its mechanism is worth knowing because it dictates your RPO.
+
+```
+   Base backup taken at 02:00 (Monday)          Target: 14:01:59
+          │                                          ▲
+          │                                          │
+   ───────┴──────────────────────────────────────────┴──────► time
+          │◄───────────── WAL segments ─────────────────►│
+          02:00           (continuous archive)         14:01:59
+                                                        │
+   Restore = (1) restore base backup files              │
+             (2) replay every WAL segment in order      │
+             (3) STOP at the target:                     │
+                 recovery_target_time = '2026-10-26 14:01:59+00'
+                 recovery_target_action = 'promote'
+                 recovery_target_inclusive = 'off'   ← excludes the bad txn
+```
+
+The RPO is therefore **governed by how much WAL is not yet in the archive**. With continuous streaming archiving that is typically **under a second**. With `archive_timeout = 60s` and low traffic, it is up to 60 seconds. With "we take a nightly `pg_dump`", it is **up to 24 hours**, and there is no way to recover anything more recent.
+
+Replay speed is the RTO's hidden cost. WAL replay is CPU-bound single-threaded in stock PostgreSQL: expect **50–200 MB/s** of WAL, so a restore that must replay **8 hours of a 250 GB/day workload** (83 GB) takes **7–28 minutes** on top of restoring the files. This is why RTO arithmetic (§9) is dominated by files, then WAL, then verification — in that order.
+
+### 4.3 The three rules, and the fourth that modern practice added
+
+The classic **3-2-1** rule:
+
+- **3** copies of the data,
+- on **2** different media or systems,
+- with **1** off-site (different region, account or provider).
+
+Modern practice adds a fourth, because of ransomware and insider risk: **1 copy that is immutable or air-gapped** — write-once (object lock in compliance mode), or offline. A backup the attacker can delete is not a backup; the standard modern attack is to hunt for and destroy backup credentials *before* triggering the encryption, and every major ransomware family now does this.
+
+What that looks like concretely for BookNook's 1.2 TB:
+
+```
+  copy 1: primary volume              (eu-west-1a)   — live
+  copy 2: synchronous standby         (eu-west-1b)   — availability, NOT a backup
+  copy 3: pgBackRest repo in S3       (eu-west-1, separate account, object-lock)
+  copy 4: WAL archive + weekly full   (eu-central-1, different provider)  ← the
+                                                             "off-site, immutable" leg
+```
+
+### 4.4 Retention: a schedule, not a feeling
+
+Retention is expressed as a **schedule per data class**, with a legal or business reason attached to each row:
+
+| Data class | Retention | Why | Mechanism |
+|---|---|---|---|
+| Orders, invoices, payments | **7 years** | Tax/audit law | Archived to Parquet in object storage; OLTP table keeps 24 months |
+| Customer account (active) | Indefinite | Service delivery | Primary DB |
+| Customer account (closed) | **30 days**, then erased | Data-protection commitments | Tombstone + hard delete job |
+| Support tickets | 3 years | Contract | Archived |
+| Clickstream / product views | **13 months** | Analytics; aggregation beyond that | Rolled up to daily aggregates, raw dropped |
+| Application logs | **30–90 days** | Debugging window | Log store lifecycle policy |
+| Security/auth logs | 1 year | Compliance | Append-only, tamper-evident |
+| Database backups | **35 days** full PITR; 12 monthly after | Ransomware + audit | Backup repo lifecycle |
+| Feature-flag / config history | 1 year | Change forensics | VCS |
+
+Three rules that make a retention policy real rather than decorative:
+
+1. **Every row has an owner and a legal basis.** If you cannot name why a class exists, it should not.
+2. **Deletion is a job with a metric**, not an intention. "How many rows did the erasure job delete last night, and how many are past their retention date right now?" — if the second number grows, deletion is broken. This is the same drift-detection pattern as Lesson 56's denormalisation.
+3. **Legal hold overrides everything.** A litigation hold means deletion *stops* for the affected records, and the mechanism must support "exclude these IDs" or you will delete evidence and the fine is much worse than the storage cost.
+
+### 4.5 The GDPR/erasure-versus-immutability conflict
+
+The genuinely hard case, and interviewers love it. A customer exercises their right to erasure. You delete their rows from the primary. What about:
+
+- the **backups** containing their data, which you cannot rewrite because they are immutable and content-addressed?
+- the **WAL archive**, which contains the original `INSERT` and which will be replayed if you ever restore?
+
+The accepted answers, in order of preference:
+
+1. **Crypto-shredding.** Encrypt each customer's sensitive fields with a **per-customer key** (envelope encryption). Erasure = **delete the key**. The ciphertext remains in every backup, forever, and is permanently unreadable. This is the only mechanism that genuinely satisfies erasure in immutable backups, and it is the answer to give in an interview.
+2. **Bounded retention + documented commitment.** "Backups expire in 35 days; erasure completes within 35 days; this is disclosed." Legally common, operationally simple, and requires the retention job to actually work.
+3. **Tombstone-and-filter on restore.** Keep a durable list of erased IDs outside the backup corpus; any restore runs a scrub step before serving traffic. Necessary as a **backstop even with crypto-shredding** (§11.6 shows why), and it must be tested, because a manual step in a restore is a step that will be forgotten at 03:00.
+
+### 4.6 Archival tiers and the retrieval-latency trade
+
+Archival moves cold data to cheaper media. The only thing that changes is **retrieval latency and cost**, and both are contractual:
+
+| Tier | Typical cost (£/GB-month) | Retrieval time | Retrieval cost | Use for |
+|---|---|---|---|---|
+| Hot (S3 Standard) | ~0.021 | instant | free | Last 30 days of backups; anything you might restore today |
+| Warm (S3 Infrequent Access) | ~0.011 | instant | per-GB fee | 30–90 day backups |
+| Cold (Glacier Instant Retrieval) | ~0.004 | instant | per-GB fee | Quarterly/monthly archives you must be able to read quickly |
+| Archive (Glacier Flexible) | ~0.0035 | **1–5 min** (expedited) / 3–5 h (standard) | per-GB fee | Yearly compliance snapshots |
+| Deep Archive | ~0.001 | **12 h** | per-GB fee | 7-year retention where retrieval is a legal event |
+
+The engineering rule: **archive tier must be chosen from your RTO, not from your CFO's enthusiasm.** Moving the only copy of a 90-day-old backup to Deep Archive silently turns a 1-hour RTO into a 13-hour one. The fix is layers — 30 days hot for fast recovery, 12 months cold for audits — which is exactly what a lifecycle policy does.
+
+## 5. Request / data flow
+
+The full path of one row from birth to vault, and the restore path that matters:
+
+```
+ ── WRITE PATH ────────────────────────────────────────────────────────────────
+   app INSERT ──► primary heap + WAL ──► synchronous standby (eu-west-1b)
+                                   │         └── availability, RPO≈0, NOT a backup
+                                   └──► WAL archive (pgBackRest → S3, object-lock)
+                                          pushed every 16 MB or 60 s
+                                          ▲ this defines the real RPO
+
+   app UPDATE/DELETE ──► same path. Note: every mistake is also in the archive.
+                          Recovery is choosing an instant BEFORE the mistake.
+
+   02:00 nightly ──► base backup (incremental since Sunday, full on Sunday)
+                      1.2 TB raw → 380 GB compressed → uploaded in 33 min
+                      → S3 eu-west-1 (separate account, object-lock compliance)
+                      → lifecycle: 35 days Standard, then monthly to eu-central-1
+
+ ── RESTORE PATH (the one that gets tested quarterly) ─────────────────────────
+   14:02  Someone committed a bad DELETE.
+   14:06  Detected (order-history 500s, dashboards, a customer tweet).
+   14:07  DECISION: do NOT fail over to the standby — it has the DELETE too.
+          Recovery target = 14:01:59.
+   14:08  Provision a scratch instance (do not touch the production primary).
+   14:09  Restore base backup from S3           ← 22 min  (download 380 GB @ 300 MB/s)
+   14:31  Decompress + apply                    ← 50 min (1.2 TB @ 400 MB/s)
+   15:21  Replay WAL to 14:01:59                ← 14 min (83 GB @ 100 MB/s)
+   15:35  Verify: row counts, checksums, a query the incident proves must work
+   15:44  Freeze writes on the broken primary; repoint the app; replay the
+          DELTA (14:02→15:44 writes) from the old primary's WAL into the new one,
+          or accept their loss (this is a business call — see §7.1)
+   15:52  Service restored. RTO achieved: 1 h 46 m. RPO: 0 for pre-14:02 data.
+          Cost: 4 months of the monthly error budget, in one afternoon.
+```
+
+The step most teams have never rehearsed is the last one: **what happens to the writes that arrived after the recovery target?** Restoring to 14:01:59 discards 1 h 42 m of customer orders that were *fine*. You either replay them (possible with logical decoding or an application-level queue, and complex) or you accept the loss and email the customers. Deciding this **before** the incident is the difference between a 2-hour outage and a 6-hour one.
+
+## 6. ASCII diagram
+
+RPO and RTO on one axis — the diagram to draw in an interview:
+
+```
+                     incident
+                        ▼
+ ───────────────────────╳──────────────────────────────►  time
+                        │◄──── RTO ────►│
+   ▲                    │               ▲
+   │                    │      service restored
+   │◄──── RPO ────►│    │
+   │               ▲    │
+ last good      last    │
+ backup      transaction│
+ (you lose everything in the ◄RPO► window: 5 minutes of orders)
+ (users are down for the ◄RTO► window)
+
+ THE TWO NUMBERS ARE INDEPENDENT:
+   RPO is about COPIES and how OFTEN they are made    → WAL archiving frequency
+   RTO is about SIZE and how FAST you can rebuild     → data volume ÷ throughput
+   Buying one does not buy the other. Say both, always.
+```
+
+The 3-2-1-1 layout, drawn:
+
+```
+                  ┌──────────────────────── eu-west-1 ────────────────────────┐
+                  │                                                          │
+   app ──► PRIMARY (1a) ──sync──► STANDBY (1b)                                │
+                  │                  │  copy 2: availability only             │
+                  │                  │                                        │
+                  └────────┬─────────┘                                        │
+                           │ WAL + base backup                               │
+                    ┌──────▼───────┐   copy 3: object-locked, separate acct   │
+                    │  S3 (bucket) │   (365-day compliance mode, versioned)    │
+                    └──────┬───────┘                                          │
+                           │ lifecycle replication                            │
+                  ┌────────▼─────────────────────────────────────────────┐    │
+                  │                                                      │    │
+                  └──────────────────────────────────────────────────────┘    │
+                  └──────────────────────────────────────────────────────────┘
+                           │ cross-provider copy
+                  ┌────────▼───────────────────────┐
+                  │ eu-central-1 · different vendor │  copy 4: THE off-site,
+                  │ monthly fulls, Deep Archive     │   immutable leg. Slow to
+                  │ restore: 12 h                   │   retrieve → RTO +12 h
+                  └─────────────────────────────────┘
+
+   Failure each leg survives:
+     primary dies          → standby promoted          (seconds)
+     AZ dies               → multi-AZ survives         (0)
+     region dies           → restore from S3 elsewhere (hours)
+     bad DELETE            → PITR to before it         (hours)   ← only backups
+     ransomware/insider    → object-lock + other vendor (days)   ← only immutability
+     account compromise    → different provider         (days)   ← only 3-2-1-1
+```
+
+The DR tier ladder, with the numbers that decide it:
+
+```
+ RTO   1 min        5 min        15 min       1 h          8 h        24 h
+  │      │            │            │           │            │          │
+  ▼      ▼            ▼            ▼           ▼            ▼          ▼
+ multi-site      hot standby   warm standby  pilot light  backup &  tape in a
+ active/active   (always on,   (running,     (core only,   restore   vault
+ (2x cost)       auto-failover) scaled down)  start on      (cheapest
+                                             demand)        that works)
+  │
+  └── cost rises ~2x per step to the left; complexity rises ~4x
+      "Why not multi-site active/active?" → because it costs 2x forever,
+      quadruples the consistency surface (Lesson 91), and buys 59 minutes
+      of an RTO you have not proved you need.
+```
+
+## 7. Detailed example
+
+### 7.1 The bad `DELETE` — the incident that defines why backups exist
+
+**14:02:11.** An engineer runs a cleanup script to purge abandoned carts. The script was tested against a table called `carts`. In production, a migration renamed it to `cart_items` and reused the name `carts` for something else. The script begins:
+
+```sql
+DELETE FROM carts;   -- intended: DELETE FROM carts WHERE updated_at < now() - interval '90 days';
+```
+
+It deletes **2.1 million rows** of active carts, and commits. Replication carries it to the standby in 11 ms. The backup archive carries it too — that is its job.
+
+**14:06.** Checkout starts failing: `cart_items` foreign-key violations. Alert fires.
+
+**14:07.** The first instinct — "fail over to the standby" — is **wrong, and this is the crux of the lesson.** The standby has the identical `DELETE`. Failover changes nothing and burns 20 minutes.
+
+**14:08–15:44.** PITR restore to `14:01:59`, as in §5, in a **new** instance. Total: **1 h 37 m**.
+
+**Then the decision nobody had pre-made:** 1 h 42 m of *good* writes (4,900 carts created, 3,100 orders started) arrived after the recovery target and do not exist in the restored database. Options:
+
+| Option | Cost | Risk |
+|---|---|---|
+| Accept the loss, email affected users | 8,000 users re-do their cart | Trust, support load |
+| Replay the delta from the old primary's WAL via logical decoding | 3–4 hours of engineering, now | Complexity under incident pressure |
+| Restore twice: once at target, once at 15:44, diff the tables, merge | 3 more hours | Merge conflicts, no transactions |
+
+BookNook chose option 1 and changed three things afterwards, which is the real output of the incident:
+
+1. **A warm standby with delayed replay** — a replica kept **1 hour behind** on purpose. For a bad `DELETE`, the delayed replica is a *correct* copy of the world as of 14:01 and can be promoted in **4 minutes** instead of a 96-minute restore. This is the single cheapest RTO improvement available for logical corruption, and it is what "PITR" looks like when it is engineered rather than documented.
+2. **No `DELETE` without a `LIMIT`-style guard.** Their cleanup scripts now require a `WHERE` clause on a `created_at` column (enforced by a lint rule) and run in batches with a row-count ceiling.
+3. **The restore drill became quarterly and mandatory.** The first real restore in company history found that the documented procedure referenced a bucket in the wrong account and a decryption key held by someone who had left.
+
+### 7.2 The 09:00 ransomware morning
+
+A developer's laptop is compromised; credentials for the CI role are stolen; the attacker spends two weeks discovering infrastructure, then:
+
+- deletes the production volumes,
+- deletes the S3 backup bucket,
+- **is stopped at the replica bucket** because it is in **compliance-mode object lock** — no one, including the account root, can delete or shorten retention for 365 days,
+- and the cross-provider copy was never reachable with those credentials at all.
+
+Recovery: restore the latest base backup + WAL from the locked bucket, **skipping the attacker's window**, into a new account created from infrastructure-as-code. **RTO: 31 hours** (the account rebuild was the long pole, not the data). **RPO: 0** (WAL was continuous to the moment of deletion).
+
+Three details worth taking away:
+
+- The **account rebuild** dominated the RTO. Data recovery was 2 hours; IAM, VPC, DNS, secrets, certificates and the pipeline were 29. Backups cover **data**; DR covers **the ability to run the service**, and they are different documents.
+- The **immutability was the whole defence.** Without it, RPO becomes "whatever was on a laptop".
+- The restore ran with a **tombstone scrub** (§4.5) so that previously erased customers were not resurrected by the restore — which is precisely the step people forget.
+
+## 8. Code or configuration example
+
+```bash
+# ============================================================================
+# BookNook backup configuration. pgBackRest + object storage. Illustrative:
+# verify against your provider's current options and your own throughput.
+# ============================================================================
+
+# --- 1. pgBackRest: base backups + CONTINUOUS WAL ---------------------------------
+# /etc/pgbackrest/pgbackrest.conf
+[global]
+repo1-type=s3
+repo1-s3-bucket=booknook-pgbackrest-euwest1
+repo1-s3-region=eu-west-1
+repo1-s3-key-type=auto
+repo1-retention-full=4                # 4 weekly fulls; PITR window = 35 days
+repo1-retention-full-type=time
+repo1-retention-archive=35            # WAL kept 35 days: THE PITR WINDOW
+repo1-cipher-type=aes-256-cbc         # encrypt at rest; key lives in KMS, NOT here
+repo1-bundle=y                        # fewer, larger objects: cheaper + faster
+process-max=8                         # parallelism on compress/transfer
+compress-type=zst
+compress-level=3
+
+[global:archive-push]
+archive-async=y
+archive-push-queue-max=8gb            # if the repo is unreachable, buffer up to
+                                      # 8GB locally, then WARN, then (finally)
+                                      # stop accepting writes. DELIBERATE:
+                                      # an unbounded queue means silently
+                                      # accepting writes you cannot recover.
+                                      # This is a CP choice for durability.
+
+[booknook]
+pg1-path=/var/lib/postgresql/16/main
+
+
+# --- 2. The schedule (§4.4 retention, §9 arithmetic) --------------------------
+#  Sunday 01:00  full      (1.2 TB → 380 GB compressed → ~33 min upload)
+#  Mon–Sat 01:00 diff      (~40 GB incremental)
+#  every 16MB or 60s: WAL archive
+#  Quarterly: RESTORE DRILL (§4.3) — non-negotiable, calendar-invited
+pgbackrest --stanza=booknook --type=full backup
+pgbackrest --stanza=booknook --type=diff backup
+
+# VERIFY THE BACKUP, not just that the job exited 0.
+pgbackrest --stanza=booknook verify          # checksums every file in the repo
+pgbackrest --stanza=booknook info            # what you actually have, and until when
+
+
+# --- 3. PITR restore to a scratch instance (§5) -------------------------------
+pgbackrest --stanza=booknook --type=time \
+  --target="2026-10-26 14:01:59+00" \
+  --target-action=promote \
+  --delta \
+  --pg1-path=/var/lib/postgresql/16/restore \
+  --restore-command="systemctl start postgresql@restore" \
+  restore
+# --target-action=promote: stop replaying at the target and open read-write.
+# PostgreSQL's own spelling of the same thing:
+#   restore_command = 'pgbackrest --stanza=booknook archive-get %f "%p"'
+#   recovery_target_time = '2026-10-26 14:01:59+00'
+#   recovery_target_inclusive = 'off'    ← excludes the transaction AT the target
+#   recovery_target_action = 'promote'
+
+
+# --- 4. THE DRILL: prove it, every quarter, automatically --------------------
+# This script is the backup strategy. Everything above is the mechanism.
+set -euo pipefail
+TARGET=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+pgbackrest --stanza=booknook --type=time --target="$TARGET" \
+           --target-action=promote --pg1-path=/tmp/drill restore
+pg_ctl -D /tmp/drill start
+# 1. does it start at all?
+psql -h /tmp -d booknook -c 'SELECT 1'
+# 2. is the data plausible? (compare against the production counts as of TARGET)
+psql -h /tmp -d booknook -c "
+  SELECT (SELECT count(*) FROM orders)      AS orders,
+         (SELECT count(*) FROM order_items) AS items,
+         (SELECT max(created_at) FROM orders) AS newest;"
+# 3. does the RESTORE-SPECIFIC logic work? (tombstone scrub, §4.5)
+psql -h /tmp -d booknook -c "SELECT count(*) FROM customers WHERE erased_at IS NOT NULL;"
+# 4. record the timings → this is how RTO stays a number rather than a hope
+echo "{\"drill\":\"$(date -u +%FT%TZ)\",\"target\":\"$TARGET\",\"rto_sec\":$SECONDS}" \
+  >> /var/log/booknook/restore-drills.jsonl
+pg_ctl -D /tmp/drill stop; rm -rf /tmp/drill
+
+
+# --- 5. Immutability: the layer that stops ransomware ------------------------
+aws s3api put-object-lock-configuration \
+  --bucket booknook-pgbackrest-euwest1 \
+  --object-lock-configuration '{
+    "ObjectLockEnabled": "Enabled",
+    "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE", "Days": 365}}
+  }'
+# COMPLIANCE mode cannot be shortened or removed by ANY principal, including the
+# account root. That property is the point: a stolen credential cannot delete it.
+# The cost: you WILL pay to store 365 days of backups, and you cannot undo that
+# even if you are wrong about needing them. Choose the number deliberately.
+```
+
+```sql
+-- ============================================================================
+-- Retention and erasure, as SQL you can actually run and monitor.
+-- ============================================================================
+
+-- --- 1. Is deletion keeping up? The one metric that proves retention is real.
+SELECT 'orders_to_archive' AS class,
+       count(*) AS overdue_rows
+FROM   orders
+WHERE  created_at < now() - interval '24 months'   -- OLTP keeps 24 months
+  AND  archived_at IS NULL
+UNION ALL
+SELECT 'accounts_to_erase', count(*)
+FROM   customers
+WHERE  closed_at < now() - interval '30 days'
+  AND  erased_at IS NULL
+  AND  id NOT IN (SELECT customer_id FROM legal_holds);  -- §4.4 rule 3
+-- Alert if any of these GROWS for two consecutive days: that is deletion broken,
+-- and it is a compliance breach on a timer, not a performance problem.
+
+-- --- 2. Crypto-shredding: erasure that works inside immutable backups (§4.5)
+-- Each customer's PII columns are encrypted with a per-customer data key, which
+-- itself is wrapped by a KMS master key. Erasure:
+UPDATE customers SET pii_key_id = NULL,                         -- destroy the DEK
+                     name = NULL, email = '(erased)', phone = NULL,
+                     erased_at = now()
+WHERE  id = $1;
+-- The ciphertext still exists in every backup until it expires. It is now
+-- permanently undecryptable, which is what "erased" has to mean when the
+-- storage is immutable. The UPDATE itself is backed up too — and is a no-op
+-- when replayed.
+
+-- --- 3. Archival: move cold OLTP rows to object storage as Parquet (L58)
+-- Then DELETE in BATCHES, never one enormous transaction (L49: WAL volume,
+-- replication lag, and a 40-minute lock are all consequences of batch = ∞).
+DELETE FROM orders
+WHERE  order_id IN (
+         SELECT order_id FROM orders
+         WHERE  created_at < now() - interval '24 months'
+           AND  archived_at IS NOT NULL
+         LIMIT  10000          -- bounded: replication lag stays sub-second
+       );
+-- Repeat until 0 rows. Monitor replication lag after EACH batch (Lesson 34).
+```
+
+## 9. Numerical example
+
+BookNook's primary is **1.2 TB**, growing **4 GB/day**, writing **250 GB/day of WAL**. Ingest peaks at 5,000 writes/sec across order, inventory and payment tables — about 10 customer orders per second at peak.
+
+**Step 1 — backup size and the upload window.**
+
+```
+raw database                        = 1,200 GB
+zstd level 3 on PostgreSQL heap     ≈ 3.1 : 1        → 387 GB
+weekly full                         = 387 GB
+daily differential (≈1 day of churn) ≈ 40 GB raw/4GB net churn → 14 GB
+WAL per day                         = 250 GB → 62 GB compressed
+```
+
+Upload time for the weekly full, on a 1.6 Gbps (200 MB/s) link:
+
+```
+387 GB × 1,024 MB/GB ÷ 200 MB/s = 1,982 s ≈ 33 min
+```
+
+A 33-minute window is fine at 01:00 and would **not** be fine on a saturated business-hours link — which is why backups run at night and why a backup that overruns into peak is a latency incident (it competes for disk and network).
+
+**Step 2 — RTO, broken down. This table is the answer to "what is your RTO?"**
+
+| Phase | Time | Dominated by |
+|---|---|---|
+| Provision instance + attach storage | 4 min | automation (IaC), not data |
+| Download base backup (387 GB @ 300 MB/s) | 22 min | **network** |
+| Decompress + write 1.2 TB @ 400 MB/s | 50 min | **disk write throughput** |
+| Replay WAL (83 GB @ 100 MB/s) | 14 min | **single-threaded replay** |
+| Integrity verification (counts, checksums) | 5 min | must not be skipped |
+| Repoint app, DNS/TTL, warm caches, connection pools | 10 min | **DNS TTL is a config decision** |
+| **Total** | **105 min** | |
+
+So the **documented** RTO of "1 hour" was **fiction** — the real RTO is **1 h 45 m**, and the only reason anyone knew was that they measured it in a drill. The two fixes that matter, in order of value per rupee:
+
+1. **A delayed replica** (1 hour behind) turns the common case (logical corruption) into a **4-minute promotion**, because no download and no replay are needed — the files are already local.
+2. **A warm standby in a second region** turns a regional loss into a **12-minute promotion**, at roughly **+70 % infrastructure cost** for the standby plus cross-region WAL shipping (~62 GB/day compressed, ~£1.30/day in egress… and note that egress, not storage, is usually the surprise line item).
+
+**Step 3 — what an RPO costs.** Compare three architectures on the *same* database:
+
+| Design | RPO | Cost per month (approx) | Real cost |
+|---|---|---|---|
+| Nightly logical dump only | **24 h** | ~£8 storage | 24 h × 5,000 writes/s = **432 M operations lost** |
+| Nightly full + continuous WAL archive | **< 1 s** | ~£45 storage | WAL replay adds 14 min to RTO |
+| Synchronous standby + WAL archive | **0** | ~£380 (compute + storage) | **+1.5 ms on every commit, forever** (Lesson 59 §9) |
+
+The middle row is almost always the right answer, and the reason is arithmetic: it converts a 432-million-operation loss into a sub-second loss for **£37/month**.
+
+**Step 4 — storage cost over time, because retention is a growing line item.**
+
+```
+35 days of PITR window:
+  5 weekly fulls × 387 GB                       = 1,935 GB
+  30 differentials × 14 GB                      =   420 GB
+  35 days of WAL × 62 GB                        = 2,170 GB
+                                          total = 4,525 GB  (4.4 TB)
+
+Hot tier (35 days, ~£0.021/GB-mo):  4,525 × 0.021   = £95/mo
+Then monthly fulls to cold, 12 months, Deep Archive (~£0.001):
+  archiving 12 × 387 GB = 4,644 GB
+  £4.64/mo, but retrieval is 12 h → RTO for anything older than 35 days = 12 h
+
+Total steady state: ~£100/month, growing ~£3/month as the database grows 4 GB/day.
+```
+
+**Step 5 — the number that justifies all of it.** One hour of checkout downtime at BookNook's peak is **10 orders/sec × 3,600 s = 36,000 lost orders** at an average order value of **£18** = **£648,000 of gross revenue**, plus the trust cost. The backup and DR programme costs **£100/month plus one engineer-week a year for drills**. The break-even is **four minutes of downtime per year**. There is no other engineering investment in this course with that ratio, which is why "did you test the restore?" is a senior-interview question and not a formality.
+
+## 10. Trade-offs
+
+| Decision | Buys you | Costs you | Choose it when |
+|---|---|---|---|
+| **Nightly logical dump only** | Dead simple, portable, per-table restore | 24 h RPO, hours of RTO, index rebuild on restore | Databases under ~50 GB; non-critical internal tools |
+| **Base backup + continuous WAL** | Seconds-level RPO, PITR to the transaction | Repo storage (4× the database over a 35-day window), replay time | **The default for any database you would page someone about** |
+| **Delayed replica (1 h behind)** | Logical-corruption recovery in minutes | 1 h of extra compute; a replica you must remember not to promote accidentally | Any system where a human can run a bad `UPDATE` |
+| **Synchronous standby** | RPO = 0 | +cross-AZ latency on every commit; availability coupling (Lesson 59) | Money, irrefutable records |
+| **Managed PITR (RDS/Aurora)** | Someone else tests the restores; 5-min RPO for free | Cost premium; less control; restore is whole-instance | The default choice for teams without a dedicated DBA |
+| **Object lock / WORM** | Survives ransomware and insider deletion | You cannot prune early, ever; you pay for the full window | Every backup corpus, no exceptions |
+| **Cross-region + cross-provider copy** | Survives a region or an account loss | Egress cost; key management complexity; slow retrieval | When a regional outage is a stated business risk |
+| **Deep Archive for everything** | Cheapest per GB | 12 h retrieval silently becomes your RTO | Only data you never expect to restore, or a legal-only copy |
+| **Keep everything forever** | No retention decisions to make | Growing cost, growing blast radius, and a **compliance liability** | Never — indefinite retention of personal data is itself a violation |
+| **Aggressive deletion (30 days)** | Cheap, minimal exposure | No forensic ability beyond a month; no year-over-year analysis | Data with genuinely short value (logs, clickstream) |
+
+## 11. Failure scenarios
+
+**11.1 — The backup job that stopped running in March.** Every monitoring check was "did the job exit 0?" and the job's cron entry was replaced during a base-image upgrade. Nobody noticed for **seven months**, because nothing alerts on "no new backup in the repo". **Symptom:** discovery at the worst possible moment. **Fix:** alert on **`pgbackrest info` age of the newest backup > 26 hours**, on repo size growth stalling, and on the *absence* of a success metric, not just on failures.
+
+**11.2 — The restore that failed for want of one WAL segment.** `repo1-retention-archive=7` while the base backups were kept for 35 days. Restoring a 20-day-old backup needs 20 days of WAL; it had 7. The restore died at replay with `could not find file "00000001000000A20000004B"`. **Symptom:** a restore that fails *after* 40 minutes of work. **Fix:** `retention-archive` must be ≥ the full-backup retention window, and the drill (§8.4) proves it rather than assuming it.
+
+**11.3 — The unencrypted bucket.** Backups were encrypted in transit only; the bucket was private. When a support engineer's credentials leaked, 1.2 TB of customer order history walked out. **Symptom:** a breach notification, not an outage — which is why it never appears in availability reviews. **Fix:** encryption at rest with **separate key custody** (KMS, not a key file next to the backup), and object-lock so deletion is not an option for the attacker.
+
+**11.4 — Restoring the erased customer.** A restore for the §7.1 incident brought back 900 customers who had exercised erasure rights; the tombstone scrub was a manual wiki step performed by whoever was on call. It was not performed. **Symptom:** a compliance breach created *by the recovery procedure*. **Fix:** the scrub is part of the automated restore pipeline, and §8.4's drill asserts it.
+
+**11.5 — Snapshot, not backup.** The team's "backup" was an EBS snapshot of the primary volume, taken hourly, in the same account. An insider deleted the volume and all its snapshots in 90 seconds. **Symptom:** total, unrecoverable loss. **Fix:** the snapshot was copy 2; there was no copy 3 or 4. §4.3.
+
+**11.6 — Legal hold versus the deletion job.** The nightly erasure job deleted a customer's records that were under litigation hold; the hold was tracked in a spreadsheet. **Symptom:** spoliation, and a much larger problem than the original dispute. **Fix:** holds are **database rows**, joined by the deletion job (§8.1), with a test that a held ID is never erased.
+
+**11.7 — Backup window colliding with peak.** A larger database pushed the diff backup past 07:00 into peak traffic; its sequential reads evicted the buffer pool, p99 went from 12 ms to 300 ms, and the cause was invisible in the application metrics. **Symptom:** a daily latency spike at the same hour. **Fix:** rate-limit backup I/O (`compress-level`, `process-max`, ionice/systemd `IOWeight`), schedule against the growth trend, and alert on backup duration approaching the window.
+
+**11.8 — Restore worked; nothing else did.** After a region loss, the database was restored in 2 hours — and the service stayed down for 29 more because the DNS records, TLS certificates, secrets, IAM roles and deployment pipeline lived only in that region. **Symptom:** an RTO dominated by everything *except* data. **Fix:** DR covers the whole stack, and the drill restores the whole stack (or at least enumerates what is not covered and says so out loud).
+
+**11.9 — WAL archive queue unbounded.** `archive-push-queue-max` was removed to "avoid write stalls", so the primary kept accepting writes while WAL piled up locally for two days — and then the disk filled and the database went read-only at the worst possible time. **Symptom:** an availability cliff caused by a durability setting. **Fix:** a **bounded** queue with an explicit, alarmed threshold (60 %/80 %), and an alarm on the *age* of the oldest unarchived segment. Whether writes block when the archive is unreachable is a CP-versus-AP choice (Lesson 59) and must be made deliberately, in writing.
+
+## 12. Alternatives
+
+| Instead of | Consider | When |
+|---|---|---|
+| Self-managed pgBackRest | **Managed PITR** (RDS/Aurora/Cloud SQL) | Team under ~5 engineers; the vendor's tested restores beat your untested ones |
+| Full backups nightly | **Differential/incremental + WAL** | Database > ~200 GB, where a nightly full no longer fits the window |
+| Backups for analytics history | **CDC into a warehouse** (Lesson 85, Phase 3 L58) | You want *history* for analysis, not recovery — a backup is the wrong tool for querying the past |
+| Restoring to recover deleted rows | **Soft deletes + tombstones** in the primary | Deleting is a routine operation; restore for it is a 105-minute answer to a 1-second question |
+| Delayed replica promotion | **PITR** | The corruption is older than the delay window, or partial (one table) |
+| Multi-region active/active | **Warm standby + tested runbook** | Almost always. Active/active quadruples the consistency surface (Lesson 91) for an RTO gain you probably cannot justify |
+| Object storage for everything | **Tiered lifecycle** | Cost matters and retrieval latency is bounded by an explicit RTO |
+
+## 13. When to use it
+
+- **Any database you would wake someone up for.** Non-negotiable: continuous WAL archiving, immutable repository, tested restore. That is the floor, not the ambition.
+- **Before any destructive migration.** Take a fresh base backup and record its identifier in the change record — the cheapest possible insurance for a `DROP COLUMN`.
+- **When a compliance regime applies** (tax, GDPR/DPDP, PCI, HIPAA): the retention schedule and the erasure mechanism are deliverables, not afterthoughts.
+- **When storage cost grows faster than users.** Archival plus a retention schedule is usually the largest single cost lever in a data platform.
+- **When designing the error budget** (Phase 4, Lesson 89): RTO and RPO are inputs to your SLO, and their *measured* values belong in the same dashboard as your latency.
+- **Whenever someone says "we have replicas, we're safe"** — that sentence is the reason this lesson exists.
+
+## 14. When *not* to use it
+
+- **As a substitute for replication.** Backups do not give you availability; a 105-minute RTO is not a failover strategy for a disk failure.
+- **As a substitute for idempotency** (Lesson 17). Restoring to fix a duplicate charge is a catastrophe; an idempotency key is a design.
+- **_Only_ a backup, with no drill.** An untested backup is a hypothesis. If you cannot restore it, you do not have it.
+- **Snapshot-only "backups" in the same account.** Not a backup (§4.1). Three failures in §11 have this root cause.
+- **Retaining everything forever "just in case".** That is a growing cost and, for personal data, a liability. Retention is a decision with an owner.
+- **Backing up into the same blast radius.** Same account, same region, same credentials as the primary means one compromise or one control-plane fault takes both.
+- **Treating DR as a database problem.** §11.8: the data is rarely the long pole.
+
+## 15. Common mistakes
+
+1. **"We have a replica, so we have a backup."** Every `DELETE`, `DROP` and bad migration is in the replica within milliseconds.
+2. **Never restoring.** The first restore of a backup's life is usually during an incident. Drills are the deliverable.
+3. **Alerting on job failure instead of on backup age.** A disabled job fails nothing.
+4. **Retention windows that do not nest.** Base backups kept longer than the WAL that makes them recoverable (§11.2).
+5. **Deleting a replica's WAL because "it's not needed".** A standby needs WAL to catch up; pruning it strands the replica and silently inflates its lag until it cannot recover without a full rebuild.
+6. **Backups in the same account, region or provider as production.** One credential compromise, one blast radius.
+7. **No immutability.** The attacker's first step is to destroy your recovery path.
+8. **Encryption keys stored with the backups.** Encryption that the attacker can undo is not encryption. Use KMS with separate custody.
+9. **No tombstone/erasure handling in the restore path.** You will resurrect erased users (§11.4).
+10. **Unbounded WAL archive queues.** Silent data-loss exposure (§11.9), or a full disk if you prefer to lose availability instead.
+11. **Restoring over the production primary.** Always restore to a new instance and repoint; an in-place restore destroys your only remaining forensic copy of the incident.
+12. **Not deciding what happens to the delta.** The writes after the recovery target are a business decision that must be made *before* the incident (§5).
+13. **Retention expressed as intent, never as a job with a metric.** §8.1 is the difference between a policy and a wish.
+14. **Backup window colliding with peak** (§11.7), which is a latency incident in disguise.
+15. **Documenting an RTO instead of measuring one.** 105 minutes versus a documented 60 is the norm, not the exception.
+
+## 16. Interview perspective
+
+**What is actually being tested.** Three things, in order of signal value. First, whether you know that **replication is not backup**, and can articulate the failure class only backups address. Second, whether you can **derive RTO and RPO from a business requirement and price them**, rather than reciting "3-2-1". Third, whether you have internalised that **the restore is the product** — a tested, timed, rehearsed procedure with a named owner, not a cron job that exits 0.
+
+**Answers that land well:**
+
+- *"How do you protect the orders database?"* — "Continuous WAL archiving into an object-locked bucket in a separate account, with a weekly full and daily differentials, 35 days of PITR, plus a second copy at a different provider in Deep Archive for the audit tail. Measured RTO is 105 minutes for a full restore, so for logical corruption we keep a replica one hour behind — that promotes in 4 minutes instead of 105. RPO is under a second because WAL is streamed."
+- *"A bad migration dropped a column and backfilled wrong data. What do you do?"* — "Do not fail over — the standby has it too. Freeze writes, note the exact timestamp, restore a base backup to a *new* instance with `recovery_target_time` just before the migration, verify against known-good counts, then decide what to do about writes since that point. Meanwhile the delayed replica would have made this a 4-minute promotion, which is why we keep one."
+- *"How do you handle GDPR erasure with immutable backups?"* — "Crypto-shredding: per-customer keys, deletion of the key, ciphertext stays unreadable in the backups until they expire. Plus a tombstone list applied automatically by the restore pipeline, because a 35-day window and a manually applied scrub both fail eventually."
+- Volunteering **"what is the measured RTO, and when did you last restore?"** signals the whole mindset in one sentence.
+
+**Common interview tasks:** design a backup and DR strategy for a given RPO/RTO; compute a restore time from data volume and throughput; explain why a replica is not a backup; explain PITR mechanics; handle a bad `DELETE` step by step; reconcile GDPR erasure with immutable backups; choose a DR tier for a stated budget.
+
+**Red flags interviewers watch for:**
+
+- "We have RPO zero because we have synchronous replication" — confusing availability with recoverability.
+- Confusing RPO and RTO, or being unable to state them as time.
+- No mention of testing the restore.
+- Backups stored in the same blast radius as the primary (same account, region, credentials).
+- Not knowing that a restore creates a *new* instance, in parallel, not in place.
+- No answer for "the writes after the recovery point".
+- "3-2-1" recited with no rationale, and no immutability in the design.
+- Treating backups as purely an ops concern with no legal/retention dimension, or vice versa.
+- Saying "we keep everything forever" and not noticing the compliance implication.
+- No numbers: no sizes, no throughputs, no restore times.
+
+## 17. Knowledge check
+
+**Conceptual**
+
+1. Explain precisely why a synchronous replica does not protect you against a mistaken `DELETE`, and identify the class of failures in which it *is* the right recovery mechanism. Then state the one design that recovers from the `DELETE` in minutes rather than hours, and explain why it is not simply "a backup".
+2. Define RPO and RTO and explain why they are independent. Then explain why a snapshot taken every hour in the same account does **not** achieve RPO = 1 hour from a risk perspective, even though its data age is 1 hour.
+3. Describe how crypto-shredding satisfies an erasure request in the presence of immutable 35-day backups, state the remaining gap it does not close, and name the compensating control.
+
+**Practical scenario**
+
+4. BookNook's database is 1.2 TB, grows 4 GB/day, writes 250 GB/day of WAL, and peak ingest is 5,000 writes/sec. The business states: **RPO ≤ 5 seconds, RTO ≤ 30 minutes, 35-day PITR, erasure within 30 days, and ransomware must not be able to destroy recoverability.** Current measured full-restore time is 105 minutes and the database sits behind a 1.6 Gbps link. Design the complete solution: repository topology with failure domains, backup types and schedules, retention nesting for base backups and WAL, the mechanism that achieves the 30-minute RTO, the erasure mechanism and where it hooks into the restore path, the immutability control, three alerts, and the quarterly drill you would automate with the pass criteria for each step.
+
+**Calculation**
+
+5. A database is 800 GB raw with a 3.2:1 compression ratio; WAL is 180 GB/day (3.5:1 compressed); the backup link runs at 300 MB/s; restore writes at 500 MB/s; WAL replay runs at 120 MB/s. (a) Compute the compressed full-backup size and its upload time. (b) Compute the restore time for a restore requiring 6 hours of WAL replay, broken into download, decompress/write, replay, and a fixed 15 minutes for provisioning, verification and repointing. (c) Compute the 30-day repository footprint assuming 5 fulls, 25 differentials of 12 GB compressed, and 30 days of compressed WAL. (d) Compute the monthly cost at £0.021/GB hot for the first 30 days and £0.001/GB Deep Archive for a further 12 months of monthly fulls.
+
+6. An incident requires restoring to a point 1 hour 42 minutes in the past. During that window the system accepted 5,000 writes/sec, of which 10 per second were customer orders with an average value of £18. Calculate (a) the total number of write operations that must be discarded or replayed, (b) the number of orders affected, (c) the gross revenue at risk, and (d) the percentage of a 99.95 % monthly error budget consumed if the outage lasts 105 minutes.
+
+**Progress checklist**
+
+- Phase 1 — Foundations (Lessons 1–17): **complete** ✅
+- Phase 2 — Scaling (Lessons 18–39): **complete** ✅
+- Phase 3 — Data and Storage:
+  - [x] Topic 1 — Relational databases (L40)
+  - [x] Topic 2 — Tables, keys, relationships, joins, constraints (L41)
+  - [x] Topic 3 — SQL versus NoSQL (L42)
+  - [x] Topic 4 — Key-value databases (L43)
+  - [x] Topic 5 — Document databases (L44)
+  - [x] Topic 6 — Wide-column databases (L45)
+  - [x] Topic 7 — Graph databases (L46)
+  - [x] Topic 8 — Search engines and full-text indexes (L47)
+  - [x] Topic 9 — Selecting a database from access patterns (L48)
+  - [x] Topic 10 — ACID transactions (L49)
+  - [x] Topic 11 — Isolation levels (L50)
+  - [x] Topic 12 — Dirty/non-repeatable/phantom reads, lost updates (L51)
+  - [x] Topic 13 — Optimistic versus pessimistic concurrency control (L52)
+  - [x] Topic 14 — Database indexes (L53)
+  - [x] Topic 15 — B-tree, hash, composite, covering, secondary indexes (L54)
+  - [x] Topic 16 — Query plans and index trade-offs (L55)
+  - [x] Topic 17 — Normalisation and denormalisation (L56)
+  - [x] Topic 18 — OLTP versus OLAP (L57)
+  - [x] Topic 19 — Data warehouses, data lakes, lakehouses (L58)
+  - [x] Topic 20 — CAP theorem (L59)
+  - [x] Topic 21 — PACELC (L60)
+  - [x] Topic 22 — Consistency models (L61)
+  - [x] Topic 23 — Object, block, and file storage (L62)
+  - [x] **Topic 24 — Retention, archival, backups, disaster recovery (L63) ← you are here**
+  - [x] **Phase 3 complete — see the Phase 3 wrap-up next**
+
+**NEXT: Phase 3 Wrap-Up — Data and Storage**
 
 ---
 

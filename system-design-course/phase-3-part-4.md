@@ -2714,3 +2714,678 @@ Phase 3 — Data & Storage
 **NEXT LESSON: Phase 3, Topic 16 — Query Plans and Index Trade-offs**
 
 ---
+
+# Lesson 55 — Query Plans and Index Trade-offs
+
+*Phase 3, Topic 16*
+
+## 1. Simple definition
+
+A **query plan** is the concrete physical strategy the database's **optimizer** chose to answer your SQL: which tables to read, in which order, by which access method (sequential scan, index scan, bitmap scan), which join algorithm (nested loop, hash, merge), and where to sort. SQL is *declarative* — you say what you want — and the plan is the *imperative* program the engine actually runs.
+
+**`EXPLAIN`** shows the plan the optimizer *estimates*. **`EXPLAIN ANALYZE`** executes the query and shows the plan it *actually* got, with real row counts and real times. The difference between the two is the single most useful diagnostic in relational databases: comparing estimated rows to actual rows tells you whether the planner had good information.
+
+An **index trade-off** is the exchange every index makes: it makes *some* reads dramatically faster, and makes *every* write to that table slower and consumes RAM that would otherwise cache data pages. "Should I add an index?" is therefore never a yes/no question. It is "which specific query, costing how many milliseconds today, am I willing to pay how many writes per second to fix?"
+
+Lesson 53 explained what an index *is* and how selectivity works. Lesson 54 covered index *types*. This lesson is the missing half: how the engine decides whether to use one, how to read that decision, and how to price the decision in both directions.
+
+Terms defined before use:
+
+- **Selectivity**: the fraction of rows a predicate keeps. `status = 'cancelled'` on 2 % of rows is highly selective; `status != 'cancelled'` at 98 % is not. Selectivity is the *only* input that matters most of the time.
+- **Cardinality estimate**: the planner's guess at how many rows a step returns. It is a **guess derived from statistics**, and when it is wrong the plan is usually wrong.
+- **Cost**: a unitless number, not milliseconds. By default one unit ≈ the cost of reading one 8 KB page sequentially (`seq_page_cost = 1.0`).
+- **Plan node**: one step of the tree — `Seq Scan`, `Index Scan`, `Hash Join`, `Sort`, and so on. Plans are trees read bottom-up: leaves read tables, parents consume children.
+- **Access path**: the way a single table is read. This is where indexes live or do not.
+
+The one sentence to carry out of this lesson: **the optimizer is not smart or dumb, it is *informed* — and nearly every "the database ignored my index" incident is a case of the statistics saying something true-but-misleading, or of the query being written in a shape that hides the index.**
+
+## 2. Why it exists
+
+If you wrote the plan yourself, you would never have this problem — you would write "use the index on `(customer_id, created_at)`, walk it backwards, stop after 20 rows". That is what a key-value store makes you do (Lesson 43): you name the access path, and the engine obeys, forever.
+
+The declarative bargain (Lesson 42) is the opposite: you name the *result*, and the planner picks the path **at execution time, using current statistics**. You give up control in exchange for the plan adapting as the data changes. That bargain is usually excellent — the planner picks better access paths than a human who last looked at the schema six months ago — and occasionally catastrophic.
+
+BookNook's checkout page is the concrete case. The query is a single statement:
+
+```sql
+SELECT o.order_id, o.created_at, o.total_pence, o.status
+FROM   orders o
+WHERE  o.customer_id = $1
+  AND  o.created_at >= now() - interval '30 days'
+ORDER  BY o.created_at DESC
+LIMIT  20;
+```
+
+On a table of **50 million orders**, this has at least five plausible plans:
+
+1. Sequential scan the whole table, filter, sort, take 20. Cost: read **6 GB**.
+2. Use an index on `customer_id`, fetch the matches, sort them, take 20.
+3. Use a composite index on `(customer_id, created_at DESC)` and read 20 rows in order — no sort at all.
+4. Use a bitmap index scan to collect matches in bulk, then a bitmap heap scan.
+5. Use a *parallel* sequential scan across 8 workers, then a top-N sort.
+
+Plans 3 and 1 differ by roughly **three orders of magnitude** on a warm cache and **four** on a cold one. Nothing in the SQL changed. The database picked one of them — and if it picked 1, your p99 checkout latency is 4 seconds and your on-call engineer is looking at a graph wondering why a 20-row query is slow.
+
+The second reason this lesson exists is the write side. Every index is a second copy of part of the table that must be maintained transactionally. A beginner's fix for a slow query is "add an index"; do that five times and the table that sustained **5,000 inserts/sec** now sustains **2,100**, the WAL volume has doubled (Lesson 63's backup window just grew), and each write holds more latches under concurrency (Lesson 52). **Indexes are a budget, not a free action.**
+
+## 3. Real-world analogy
+
+A courier company's routing system.
+
+The dispatcher (the **optimizer**) has a map of the city (the **statistics**) annotated with measured traffic (the **cost constants**). Given a delivery, it computes the cheapest route and hands it to a driver (the **executor**). Nobody hand-writes the route, because the traffic changes hourly and a human cannot evaluate thousands of routes per second.
+
+Two things go wrong, and both are the whole lesson:
+
+- **The traffic data is stale.** A bridge closed at 06:00 for roadworks. The dispatcher does not know, so it routes 400 vans over it, and the "optimal" route is the slowest one in the city. In database terms: **statistics not refreshed after a bulk load**, or an estimate that ignores the correlation between two columns. The dispatcher made a *perfectly rational* decision from wrong information, which is exactly what your database is doing.
+- **The map does not show a road that exists.** There is a service lane behind the depot that reaches the address in 90 seconds. It is not in the map, so the dispatcher never considers it. In database terms: **an index the planner cannot use** because the query wraps the column in a function, casts a type, or has a leading wildcard — the road exists, but not in the form the map understands.
+
+The managerial lesson follows: when a delivery is late, you do not shout at the dispatcher. You check the traffic data and the map. When a query is slow, you do not add an index — you read the plan and check the statistics.
+
+## 4. Detailed technical explanation
+
+### 4.1 What happens between SQL text and rows
+
+Every statement passes through the same pipeline:
+
+```
+  SQL text
+     │
+     ▼
+ 1. PARSE        ── syntax tree
+     │
+     ▼
+ 2. REWRITE      ── expand views, apply rules, flatten subqueries
+     │
+     ▼
+ 3. PLAN         ── logical plan → physical plan by cost comparison
+     │              (this lesson, §4.2–4.4)
+     ▼
+ 4. EXECUTE      ── pull rows through the plan tree
+     │
+     ▼
+ 5. RETURN       ── rows to the client
+```
+
+Step 3 is where the interesting work lives. For a 6-table join there are up to `6! = 720` join orders and, per table, several access paths, several join algorithms and several sort strategies. The search space is large enough that the planner does not enumerate it exhaustively; it uses **dynamic programming over subsets** (PostgreSQL) or a **cost-based greedy/Cascades search** (Oracle, SQL Server), with cut-offs. `geqo_threshold` (default 12 tables in PostgreSQL) switches to a genetic algorithm, which is a hint about how expensive exhaustive search becomes.
+
+The planner then produces a **plan tree**, and every node in that tree has:
+
+- an **estimated startup cost** (cost to produce the first row),
+- an **estimated total cost** (cost to produce all rows),
+- an **estimated row count** (`rows=`),
+- an **estimated row width** in bytes (`width=`).
+
+Cost, not time. In PostgreSQL's default configuration, `seq_page_cost = 1.0` means "one 8 KB page read sequentially costs 1 unit". Everything else is scaled against that:
+
+| Constant | Default | Meaning | Sensible value on NVMe SSD |
+|---|---|---|---|
+| `seq_page_cost` | `1.0` | One sequential page read | `1.0` (keep as the anchor) |
+| `random_page_cost` | `4.0` | One random page read | **`1.1`** — this is the single most impactful setting on SSD hardware |
+| `cpu_tuple_cost` | `0.01` | Processing one row | `0.01` |
+| `cpu_index_tuple_cost` | `0.005` | Processing one index entry | `0.005` |
+| `cpu_operator_cost` | `0.0025` | One operator/function evaluation | `0.0025` |
+| `effective_cache_size` | `4GB` | **Hint** at how much of the table the OS will cache | ~**50–75 % of total RAM** |
+| `work_mem` | `4MB` | RAM per sort/hash node before spilling to disk | `16–64MB` for OLTP |
+
+The default `random_page_cost = 4.0` dates from spinning disks, where a random seek genuinely cost ~4× a sequential page. On NVMe the ratio is closer to **1.1–1.3**. Leaving the default on modern hardware makes the planner systematically **under-value index scans** and choose sequential scans and hash joins when an index scan would be far faster. It is the most common misconfiguration in production PostgreSQL, and it produces exactly the symptom in §7.
+
+### 4.2 The plan nodes you must recognise
+
+Leaves (**access paths**):
+
+| Node | What it does | Shows up when | Cost driver |
+|---|---|---|---|
+| **Seq Scan** | Reads every page of the table | Predicate hits a large fraction (>~5–10 %), or no usable index | Table pages × `seq_page_cost` + rows × `cpu_tuple_cost` |
+| **Index Scan** | Walks the B-tree, then fetches each matching heap row | Few matching rows, and clustered (physically co-located) | Index pages + **one random heap fetch per match** |
+| **Index Only Scan** | Walks the B-tree and answers from the index itself | Every referenced column is in the index, and pages are marked all-visible | Index pages only — no heap access |
+| **Bitmap Index Scan** → **Bitmap Heap Scan** | Builds an in-memory bitmap of matching *pages*, then reads those pages in physical order | Medium selectivity (~1–10 %), or an `AND` of two indexes | Index cost + heap pages read with **sequential-ish** locality, plus a recheck of each row |
+
+The bitmap pair deserves emphasis because it is the one most people cannot explain: it converts many random heap fetches into a smaller number of sorted, mostly-sequential page reads. Above `work_mem` it becomes **lossy** — the bitmap stores pages rather than tuples, so every row on a matching page must be rechecked against the predicate.
+
+Parents (**joins, sorts, aggregates**):
+
+| Node | What it does | Chosen when | Failure signature |
+|---|---|---|---|
+| **Nested Loop** | For each outer row, probe the inner side | Outer side small (<~1,000 rows) and inner has an index | Explodes if the estimate said 10 outer rows and the truth is 100,000 |
+| **Hash Join** | Builds a hash table from the smaller side, probes with the larger | Both sides large, equality join | Spills to disk if the build side exceeds `work_mem` → `Batches: 8` and a 10× slowdown |
+| **Merge Join** | Sorts both sides (or uses index order), then merges | Both inputs already sorted, or a sort is needed anyway | Cheap-looking but the sorts hide real cost |
+| **Sort** | Sorts in memory, or external merge sort on disk | `ORDER BY`, `GROUP BY`, `DISTINCT`, merge join | `Sort Method: external merge  Disk: 412MB` |
+| **HashAggregate / GroupAggregate** | Groups rows | `GROUP BY` | `GroupAggregate` requires sorted input |
+| **Gather / Gather Merge** | Collects output from parallel workers | Table is big enough to justify worker startup | `Workers Planned: 8  Workers Launched: 8` |
+
+### 4.3 The three questions a plan answers
+
+You do not need to read a plan line by line. You need to answer three questions, in this order:
+
+1. **Which access path was chosen for the big table, and is that defensible for the predicate's selectivity?** A sequential scan of a 50 M-row table is *correct* if the query genuinely returns 20 % of it, and a *disaster* if it returns 20 rows.
+2. **Are the row estimates anywhere near the actual rows?** Look at `rows=` (estimate) against `actual rows=` (measured). A ratio above **10×** anywhere in the plan is the root cause, and everything above it is a downstream consequence. This is the `EXPLAIN ANALYZE` superpower, and it is why estimating without measuring is guesswork.
+3. **Where did the time actually go?** `actual time` is cumulative from the node's first row to its last, so the *inclusive* time of a node minus the sum of its children's times is the time that node itself consumed. `BUFFERS` adds the physical picture: `shared hit` (buffer pool) versus `read` (disk). A node with 2,000,000 `read` blocks is a node that touched 16 GB.
+
+### 4.4 Why estimates go wrong — the four real causes
+
+The planner estimates selectivity with a formula fitted to **statistics** gathered by `ANALYZE` (auto-analyze) into `pg_statistic`. For each column it keeps a **most-common-values list** (default 100 values), an **equi-depth histogram** (100 buckets), a **`n_distinct`** estimate, and a **physical correlation** figure between index order and heap order.
+
+Four things break it, and they are worth memorising because they are the entire diagnostic toolkit:
+
+1. **Stale statistics.** A nightly ETL inserts 4 M rows. Auto-analyze has not run since, so the planner still believes the table has 900,000 rows. Every estimate is 5× low, so it chooses nested loops and index scans that are wrong by 5×. The fix is `ANALYZE` at the end of every bulk load — not a `VACUUM`, which is a different job (Lesson 53).
+2. **Correlated columns.** `WHERE city = 'Leeds' AND postcode = 'LS1 ...'` looks like two independent predicates to a per-column model, so it multiplies `P(Leeds) × P(LS1)` — typically 1/4,000 × 1/200 when the truth is 1/4,000. An estimate 200× low makes a nested loop look free. PostgreSQL 10+ can fix exactly this with **extended statistics**: `CREATE STATISTICS ... (dependencies) ON city, postcode FROM addresses;`
+3. **Skewed values not in the MCV list.** `WHERE tenant_id = 7734` where one tenant is 40 % of all rows. If that value fell outside the top-100 MCV list, the planner assumes "average" and estimates 0.02 % instead of 40 %. The plan is chosen for a 0.02 % query and executed on a 40 % query.
+4. **Expressions and type mismatches.** `WHERE lower(email) = $1` cannot use a plain index on `email` (you need an expression index). `WHERE customer_id = '4821'` where `customer_id` is `BIGINT` and the parameter arrives as `TEXT` may cost an implicit cast — and a cast on the *column* side silently disables the index.
+
+### 4.5 The other half: how an index costs writes
+
+Every `INSERT` into a table with *n* indexes must insert into the heap, insert into each of the *n* indexes, and write WAL for all of it. Every `UPDATE` must insert a new heap row version *and* either update or re-insert each index entry whose key changed.
+
+Two mechanisms decide how expensive that really is:
+
+- **HOT updates.** If an `UPDATE` changes no indexed column *and* the new row version fits on the same page, PostgreSQL writes a heap-only tuple: **no index maintenance at all**. This is huge. It is also why adding an index on a frequently updated column can cut write throughput far more than adding one on a static column — the new index breaks HOT eligibility for every update that touches that column.
+- **Index bloat.** Deleted index entries are not removed immediately; they become dead line pointers, reclaimed by `VACUUM`. An index on a churning column grows well beyond its live size, so index scans touch more pages and more of the buffer pool is spent on index pages that mostly contain garbage (Lesson 53 §bloat).
+
+The budget in one line: **an index is worth adding when `(reads saved × per-read saving) > (writes added × per-write cost)`, and both sides are measurable.**
+
+## 5. Request / data flow
+
+The path of one BookNook checkout request through planning and execution, including the caching that surprises people:
+
+```
+1. App issues:  SELECT ... WHERE customer_id=$1 AND created_at >= ... LIMIT 20
+                                    │
+2. Parse + rewrite (per execution unless a prepared statement is reused)
+                                    │
+3. PLANNER
+   ├─ lookup stats for orders.customer_id  → n_distinct=125,000 → 400 rows/customer
+   ├─ lookup stats for orders.created_at   → range 30/365 days  → 8.2% of those 400
+   ├─ estimate: 33 rows  (actual: 24 — good estimate)
+   ├─ consider Seq Scan       : 732,422 pages × 1.0 + 50M × 0.0125 = 1,357,000
+   ├─ consider Index Scan     : ~4 index pages + 33 heap pages × 4.0  = 148
+   ├─ consider Index Only Scan: 4 index pages                          = 4   ← wins if eligible
+   └─ pick lowest cost → plan tree
+                                    │
+4. PLAN CACHE
+   ├─ simple/unprepared query → planned every time (correct, but ~0.1-0.5 ms of CPU)
+   └─ prepared statement      → after 5 executions, PostgreSQL may switch to a
+                                GENERIC plan (parameter values unknown at plan time).
+                                A generic plan is parameter-blind and can be 100× worse
+                                for skewed data. This is the "it was fast in psql and
+                                slow in the app" bug (§11.3).
+                                    │
+5. EXECUTOR
+   ├─ walk the B-tree down to (customer_id, now()-30d)
+   ├─ read 24 heap rows   → shared hit=27  (warm cache)
+   ├─ no Sort node: the index already returns created_at DESC
+   └─ stop after 20 rows because of LIMIT  → the LIMIT node stops pulling
+                                    │
+6. Rows returned. Total: 0.4 ms warm, 1.1 ms cold.
+```
+
+The step worth staring at is 5's "stop after 20 rows". A `LIMIT` with an index that matches the `ORDER BY` lets the engine read **20 rows instead of scanning**; without the matching index the engine must produce *every* matching row, sort all 33 (or 3.3 million, if the predicate were broader), and then discard all but 20. Same query text, same result, wildly different work — and the difference is entirely whether an index exists whose column order matches the filter-then-order shape.
+
+## 6. ASCII diagram
+
+A real plan tree, drawn the way you should read it — **bottom-up, leaves first**:
+
+```
+                    ┌──────────────────────────────────────────┐
+                    │ Limit                                    │  ← stops pulling at 20 rows
+                    │   cost=0.56..148.20  rows=20  width=42   │
+                    └────────────────────┬─────────────────────┘
+                                         │
+                    ┌────────────────────▼─────────────────────┐
+                    │ Index Scan using orders_cust_created_idx │  ← ACCESS PATH (leaf)
+                    │   on orders                              │
+                    │   Index Cond: (customer_id = $1)         │
+                    │   Filter: (created_at >= (now()-'30 days'))│
+                    │   cost=0.56..149.03  rows=33  width=42   │
+                    │   actual time=0.031..0.187 rows=24 loops=1│
+                    │   Buffers: shared hit=27                 │
+                    └──────────────────────────────────────────┘
+```
+
+The bad version of the same query — what you get when `random_page_cost` is left at 4.0 with bad statistics, or when a cast disables the index:
+
+```
+                    ┌──────────────────────────────────────────┐
+                    │ Limit                                    │
+                    │   cost=1,357,000.00..1,357,412.00         │
+                    └────────────────────┬─────────────────────┘
+                                         │
+                    ┌────────────────────▼─────────────────────┐
+                    │ Sort  (top-N heapsort, 412 kB)           │  ← sorts 1,904,338 rows
+                    │   Sort Key: created_at DESC               │     to return 20
+                    └────────────────────┬─────────────────────┘
+                                         │
+                    ┌────────────────────▼─────────────────────┐
+                    │ Seq Scan on orders                       │  ← reads all 732,422 pages
+                    │   Filter: (customer_id = '4821'::text)   │  ← TEXT cast on a BIGINT
+                    │           AND (created_at >= ...)        │     column: index unusable
+                    │   Rows Removed by Filter: 49,998,096      │
+                    │   actual time=0.014..3,841.559 rows=20   │
+                    │   Buffers: shared hit=12 read=732,410    │
+                    └──────────────────────────────────────────┘
+```
+
+`Rows Removed by Filter: 49,998,096` means the engine read fifty million rows to keep twenty. That line is the single most damning number a plan can contain, and it appears in more production slow-query tickets than any other.
+
+The selectivity decision, which is what the whole lesson reduces to:
+
+```
+  cost
+    ▲
+    │  Seq scan ─────────────────────────────────────────────
+    │                                    ╱
+    │                                 ╱
+    │                    bitmap    ╱
+    │                          ╱
+    │            index scan ╱
+    │  ┌───────────────────╱─────────────────────────────────►
+    └──┴────┬──────────┬──────────────────────────────────────
+         0.01%       1%        5–10%                 100%   % of rows returned
+                        ▲          ▲
+                        │          └── crossover: above this, Seq Scan is genuinely
+                        │              cheaper than any index strategy
+                        └── Bitmap lives here: medium selectivity, AND-ed predicates,
+                            where random heap fetches would otherwise dominate
+```
+
+Index scans are not "the fast option" and sequential scans are not "the slow option". They are two points on a cost curve, and the planner's entire job is to pick the right point. Most of the time it does. Your job is to recognise the exceptions.
+
+## 7. Detailed example
+
+### 7.1 The 4-second checkout page
+
+BookNook's order-history endpoint is timing out at **3.8 s p99** and the on-call engineer's first instinct is a caching layer. Instead, one command:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT ...;   -- as in §6, second diagram
+```
+
+Three facts from the plan, in the order the lesson says to check them:
+
+1. **Access path:** `Seq Scan on orders`, 732,410 blocks read. 732,410 × 8 KB = **5.86 GB read per page load**. Defensible only if the query needs most of the table; it needs 24 rows.
+2. **Estimate vs actual:** the filter shows `customer_id = '4821'::text`. The parameter is bound as text and compared to a `BIGINT` column with an **implicit cast on the column side**, so the index on `customer_id` is not usable. The planner's alternative was a sequential scan, and it estimated 1,904,338 rows for the predicate — the estimate was *correct*, and the plan was still terrible, because no plan with an index existed.
+3. **Time:** 3,841 ms, of which `Sort` consumed ~1,900 ms (top-N heapsort over 1.9 M rows) and the scan ~1,900 ms.
+
+The fix is **two statements and no schema change**:
+
+```sql
+-- 1. Make the comparison type-correct so the index is usable.
+--    In the app: bind the parameter as BIGINT, not TEXT.
+SELECT ... WHERE o.customer_id = $1::bigint ...
+-- 2. Ensure the composite index exists with the filter→order shape.
+CREATE INDEX CONCURRENTLY orders_cust_created_idx
+    ON orders (customer_id, created_at DESC);
+```
+
+Result: **3,841 ms → 0.19 ms**, 5.86 GB → 27 pages. That is a **20,000× improvement from fixing the query's shape**, not from adding hardware.
+
+### 7.2 The index that made writes 2.4× slower
+
+Six weeks later, BookNook's order-ingest service drops from 5,000 to 2,100 inserts/sec and the WAL volume doubled. Nobody changed the ingest code; two indexes were added to `orders` in the meantime, both on **frequently updated** columns (`status` and `updated_at`).
+
+The mechanism:
+
+- Before: updating `status` on an order changed **no indexed column**, so PostgreSQL could write a **HOT** tuple — heap only, no index maintenance.
+- After: `status` is indexed, so every status transition (a BookNook order changes status ~7 times over its lifecycle) now writes a new entry in the `status` index, breaks HOT, and prevents every *other* index from being skipped too.
+
+The remediation is not "drop all indexes" — it is a narrower form: a **partial index** that only covers the statuses anyone actually queries in bulk:
+
+```sql
+DROP INDEX orders_status_idx;
+CREATE INDEX orders_status_open_idx
+    ON orders (status) WHERE status IN ('paid','picking','shipped');
+```
+
+Orders reach a terminal state (`delivered`, `cancelled`) and never change again, so the partial index stops being written after the last transition — and its size falls from 50 M entries to ~600,000. Write throughput recovers to 4,600/sec.
+
+The general principle: **index the state a row spends its life in, not every state it passes through.**
+
+### 7.3 The estimate that was 8,000× wrong
+
+A reporting query joins `order_items` to `books` and filters `books.publisher_id = $1`. For Harrow Press (14,000 titles) it is fast. For the largest publisher (410,000 titles, 22 % of the catalogue) it takes 47 s. Same query, different parameter — the classic **parameter-sensitive plan** problem.
+
+`EXPLAIN ANALYZE` shows `rows=51` estimated, `actual rows=412,000`. The plan chose a **nested loop** because 51 outer rows × one index probe each is cheap; with 412,000 outer rows it performs 412,000 index probes.
+
+Two fixes, in order of preference:
+
+1. **Extended statistics**, if the bad estimate comes from correlated predicates (the general fix).
+2. **Force a per-query plan shape** when the data is genuinely skewed: either split the query by publisher size, or (last resort) use `pg_hint_plan` to pin a hash join for this statement.
+
+The interesting lesson is that the planner was not wrong about the *average* — it was wrong about *this value*, because the value sat far outside its model. Skew, not stupidity.
+
+## 8. Code or configuration example
+
+```sql
+-- ============================================================================
+-- BookNook: the operational queries for plan work. Illustrative values.
+-- ============================================================================
+
+-- --- 1. THE ONLY COMMAND YOU NEED TO START -----------------------------------
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)
+SELECT o.order_id, o.created_at, o.total_pence
+FROM   orders o
+WHERE  o.customer_id = 4821
+  AND  o.created_at >= now() - interval '30 days'
+ORDER  BY o.created_at DESC
+LIMIT  20;
+
+-- Read the output in this order:
+--   (a) the leaf access path for the biggest table  → §4.2
+--   (b) rows= vs actual rows= at every node         → >10x = root cause
+--   (c) actual time of the top node vs the sum of children → where time went
+--   (d) Buffers: read= N  → N * 8KB = bytes touched
+-- NEVER run EXPLAIN ANALYZE on a write statement in production without a
+-- transaction you intend to roll back — it really executes.
+
+
+-- --- 2. STATISTICS HYGIENE ---------------------------------------------------
+-- After every bulk load. VACUUM is not a substitute (Lesson 53).
+ANALYZE orders;
+
+-- More resolution for a skewed, heavily-filtered column: the default target of
+-- 100 keeps 100 MCVs + a 100-bucket histogram. Raising it costs planning time
+-- (every plan reads the stats) and ANALYZE time.
+ALTER TABLE orders ALTER COLUMN customer_id SET STATISTICS 500;
+
+-- Correlated predicates: teach the planner that city and postcode travel together.
+CREATE STATISTICS orders_cust_time_deps (dependencies)
+    ON customer_id, created_at FROM orders;
+ANALYZE orders;
+
+-- Watch for staleness across the whole database.
+SELECT relname, last_analyze, last_autoanalyze, n_live_tup, n_mod_since_analyze
+FROM   pg_stat_user_tables
+WHERE  n_mod_since_analyze > 0.1 * GREATEST(n_live_tup, 1)
+ORDER  BY n_mod_since_analyze DESC;
+
+
+-- --- 3. PROVING AN INDEX IS USABLE (and why it might not be) -----------------
+-- Does the planner even consider this index? Disable seq scans for THIS SESSION
+-- only, then re-plan. If the plan does not change to an index scan, the index
+-- is unusable for this query shape — not merely unloved.
+SET LOCAL enable_seqscan = off;
+EXPLAIN SELECT ...;   -- if it still seq-scans, the predicate is the problem
+RESET enable_seqscan;
+-- Note: enable_* flags are cost offsets, not hints. They raise a plan's cost
+-- rather than forbidding it. Never set them globally in production.
+
+
+-- --- 4. THE INDEX SHAPES THAT ACTUALLY GET USED ------------------------------
+-- Filter + order: column order matches "equality, then range/sort".
+CREATE INDEX CONCURRENTLY orders_cust_created_idx
+    ON orders (customer_id, created_at DESC);
+
+-- Covering: answers the query from the index alone (enables Index Only Scan).
+-- INCLUDE columns are stored in the leaf pages but not used for ordering.
+CREATE INDEX CONCURRENTLY orders_cust_cover_idx
+    ON orders (customer_id, created_at DESC) INCLUDE (total_pence, status);
+-- An Index Only Scan STILL reads the heap unless the pages are marked
+-- all-visible by VACUUM. "Index Only Scan ... Heap Fetches: 1,204,882"
+-- means the index was not actually enough. Run VACUUM.
+
+-- Partial: index only the rows the query can ever want (§7.2).
+CREATE INDEX CONCURRENTLY orders_status_open_idx
+    ON orders (status) WHERE status IN ('paid','picking','shipped');
+
+-- Expression: makes `WHERE lower(email) = $1` indexable.
+CREATE INDEX CONCURRENTLY users_lower_email_idx ON users (lower(email));
+
+
+-- --- 5. FINDING THE INDEXES THAT EARN THEIR KEEP -----------------------------
+-- Unused indexes: reads = 0 since the last stats reset. Candidates for dropping,
+-- but check pg_stat_user_indexes.idx_scan over a FULL business cycle (monthly
+-- reports!), and check that the index is not a UNIQUE constraint's backing index.
+SELECT s.relname AS table, s.indexrelname AS index,
+       s.idx_scan, s.idx_tup_read, pg_size_pretty(pg_relation_size(s.indexrelid)) AS size
+FROM   pg_stat_user_indexes s
+JOIN   pg_index i ON i.indexrelid = s.indexrelid
+WHERE  i.indisunique = false AND s.idx_scan = 0
+ORDER  BY pg_relation_size(s.indexrelid) DESC;
+
+-- The cost of an index, measured rather than argued: total index bytes per table.
+SELECT relname,
+       pg_size_pretty(pg_table_size(relid))                    AS heap,
+       pg_size_pretty(pg_indexes_size(relid))                  AS all_indexes,
+       (SELECT count(*) FROM pg_index WHERE indrelid = relid)   AS n_indexes
+FROM   pg_stat_user_tables
+ORDER  BY pg_indexes_size(relid) DESC
+LIMIT  20;
+
+
+-- --- 6. THE SETTINGS THAT FIX "IT IGNORES MY INDEX" GLOBALLY -----------------
+-- postgresql.conf. Values illustrate the reasoning; calibrate per host.
+--   random_page_cost      = 1.1    -- NVMe. THE most important change. §4.1
+--   effective_cache_size  = 48GB   -- ~75% of 64GB RAM: a HINT, allocates nothing
+--   work_mem              = 32MB   -- per sort/hash NODE, multiplied by
+--                                  --   concurrent_sort_nodes x connections.
+--                                  --   200 conns x 2 nodes x 32MB = 12.8GB. Watch it.
+--   default_statistics_target = 200 -- better estimates, slower planning
+--   jit = off              -- for OLTP: JIT compilation costs more than it saves
+--                          --   on sub-10ms queries (PG 12+ default threshold
+--                          --   of jit_above_cost=100000 is usually fine, but
+--                          --   has caused real p99 cliffs when plans cross it)
+```
+
+## 9. Numerical example
+
+BookNook's `orders`: **50,000,000 rows × 120 bytes = 6.0 GB**, 8 KB pages.
+
+```
+pages        = 50,000,000 × 120 / 8,192       = 732,422 pages  (5.86 GB)
+125,000 customers  →  average 400 orders each
+```
+
+**Step 1 — cost of a full sequential scan.**
+
+```
+seq = pages × seq_page_cost  +  rows × (cpu_tuple_cost + cpu_operator_cost)
+    = 732,422 × 1.0          +  50,000,000 × (0.01 + 0.0025)
+    = 732,422                +  625,000
+    = 1,357,422  cost units
+```
+
+Measured on this hardware, a warm seq scan of 5.86 GB runs at **~3.9 s** (1.5 GB/s, CPU-bound on the filter). So **1 cost unit ≈ 2.9 µs** here — which is exactly why you must never read cost as milliseconds, and why calibrating `random_page_cost` beats trusting the defaults.
+
+**Step 2 — cost of the composite-index scan returning 24 rows.**
+
+```
+index pages walked      ≈ 4   (a 3-level B-tree plus a leaf page)
+heap fetches            = 24  (one per matching row; 24 distinct pages,
+                               because rows for one customer are scattered)
+cpu per index tuple     = 24 × 0.005
+cpu per row             = 24 × 0.01
+
+index = (4 + 24) × random_page_cost + 24 × 0.015
+      = 28 × 4.0 + 0.36
+      = 112.36  cost units
+```
+
+**Index scan is 12,000× cheaper by the cost model**, and ~20,000× faster in wall-clock. There is no subtlety here — which is why a *sequential scan* in this shape is a diagnostic signal, not a judgement call. Something upstream (a cast, a function, a missing index) prevented the index from existing.
+
+**Step 3 — where the crossover actually is.** Using a uniform distribution, a predicate returning fraction *f* of the table:
+
+```
+seq scan      = 732,422 + 50,000,000 × 0.0125              = 1,357,422
+index scan    = (f × 50M / 200 entries-per-page) × 4.0      index leaf pages (random)
+              + (f × 50M) × 4.0                             heap fetches (random)
+              + (f × 50M) × 0.015
+              = f × 50M × (0.02 + 4.0 + 0.015)  ≈  f × 201,750,000
+
+set equal:   f × 201,750,000 = 1,357,422   →   f ≈ 0.0067   ≈ 0.67 %
+```
+
+With `random_page_cost = 1.1` (NVMe), the index side falls to `f × 56.7M`, so the crossover moves to **f ≈ 2.4 %** — the index stays the better choice over **3.6× more of the table**. That is the entire reason §4.1 calls the setting "the most important change": the same hardware, the same query, and the planner's threshold moves by a factor of 3.6 purely because you told it the truth about your disk.
+
+Bitmap scans fill the gap between the two curves: at 3 % selectivity, the index scan's 1.5 M random heap fetches cost `1.5M × 1.1 = 1.65M` units, while a bitmap converts them into ~10,000 sorted page reads at `1.0` each — **165× cheaper for the same rows.**
+
+**Step 4 — what each extra index costs on the write path.**
+
+BookNook ingests **5,000 orders/sec**. Per insert, WAL is roughly:
+
+```
+heap row WAL                 ≈ 2 × 120 B                = 240 B
+each index entry WAL         ≈ 2 × 32 B                 =  64 B
+6 secondary indexes          =  6 × 64 B                = 384 B
+total WAL per insert         ≈ 624 B
+
+5,000/sec × 624 B            = 3.1 MB/sec              = 270 GB/day
+```
+
+Adding **two** indexes takes that to `240 + 8×64 = 752 B`, i.e. **325 GB/day** — a **20 % increase in WAL volume**, which is a 20 % increase in replication bandwidth (Lesson 32), in backup size and duration (Lesson 63), and in the disk write budget. Meanwhile the *read* benefit of a `status` index is small, because 91 % of orders are in one status and the planner will seq-scan anyway. The index costs 20 % more writes forever to serve queries that will never use it.
+
+That is the arithmetic to run before typing `CREATE INDEX`, and it is why §4.5's HOT discussion matters: an index on a *frequently updated* column additionally destroys HOT updates, which is usually a far larger cost than the WAL bytes.
+
+## 10. Trade-offs
+
+| Decision | Buys you | Costs you | Choose it when |
+|---|---|---|---|
+| **Leave `random_page_cost = 4.0`** | Zero thinking; conservative on spinning disks | Systematic under-use of indexes on SSD; mystery seq scans | Only if you actually run on HDD |
+| **`random_page_cost = 1.1`** | 3.6× wider window where indexes win; fewer seq-scan surprises | Slightly more index scans chosen where seq would be better on huge ranges | NVMe/SAN SSD — i.e. almost everyone today |
+| **Add a targeted composite index** | 100–20,000× on the exact query it serves | +WAL per write; RAM; one more thing to keep in sync through migrations | A measured query that is slow with an *optimal* plan for its current index set |
+| **Add a broad/defensive index** | Nothing measurable | Everything above, permanently, for a query that may never exist | Never |
+| **Covering index (`INCLUDE`)** | Eliminates heap access — often 3–5× on the served query | Leaf pages are much larger, so the index is bigger and scans more pages | A very hot query whose columns are stable and few |
+| **Partial index** | Tiny index, almost no write cost, exact fit | Only serves the predicates it declares; a `WHERE` change silently stops using it | Hot subset of a churning table (§7.2) |
+| **Force a plan (hints)** | Stops a parameter-sensitive regression now | Freezes the plan as data drifts; hides the real problem; not portable | Last resort, with a tracked ticket, scoped to one statement |
+| **Raise `default_statistics_target`** | Better estimates → better plans, no write cost | Slower `ANALYZE`, slower planning, more catalog size | Skewed columns and correlated predicates |
+| **Denormalise / materialise** | Removes the join or aggregate entirely | Synchronisation (Lesson 56) | The query is inherently expensive, not badly planned |
+| **Blaming the planner** | Emotional relief | You stop looking at the statistics, which is where the bug is | Never |
+
+## 11. Failure scenarios
+
+**11.1 — Bulk load, no `ANALYZE`.** Nightly ETL inserts 4 M rows at 02:00. Auto-analyze triggers only after `autovacuum_analyze_threshold + autovacuum_analyze_scale_factor × n_live_tup` modifications (default 50 + 10 %). By 09:00 the planner believes the table is 20 % smaller than it is, every estimate is low, and nested loops are chosen across the board. **Symptom:** a step change in latency every morning that "fixes itself" by afternoon as auto-analyze catches up. **Fix:** `ANALYZE` as the last step of the load, and a `pg_stat_user_tables` staleness alert.
+
+**11.2 — A function on the column.** Someone "improves" the query to `WHERE date_trunc('day', created_at) = CURRENT_DATE`. The index on `created_at` is now invisible: the planner would have to evaluate the function for every row, so it seq-scans. **Symptom:** a query that was 3 ms is 4 s, and the index still exists so nobody suspects it. **Fix:** rewrite as a range (`created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + 1`), or add an expression index.
+
+**11.3 — The generic-plan flip.** A prepared statement is fast in `psql` and slow in the application. PostgreSQL plans the first 5 executions with **actual parameter values** (custom plans) and then compares against a **generic plan** with parameters unknown; if the generic plan's estimated cost is not higher, it switches and stays. For a skewed parameter that is a cliff, at execution 6. **Symptom:** "it got slow after a deploy and nothing changed" — the deploy changed connection reuse. **Fix:** `plan_cache_mode = force_custom_plan` for that statement, or `SET LOCAL` it in the session; verify with `EXPLAIN (GENERIC_PLAN) SELECT ...` (PG 16+).
+
+**11.4 — `work_mem` too small.** A hash join's build side exceeds `work_mem` and spills: `Batches: 16` and a `Disk: 1,842MB` line in the plan. Latency goes from 400 ms to 6 s under memory pressure only — the plan on a quiet system looks fine. **Symptom:** latency that correlates with *concurrency*, not with traffic. **Fix:** raise `work_mem` for the specific role/reporting session, never globally (§8 note on the multiplication), or fix the estimate that made the build side bigger than the planner expected.
+
+**11.5 — Lossy bitmap.** A bitmap index scan at 8 % selectivity on a 40 M-row table exceeds `work_mem` and degrades to page-level precision: `Rows Removed by Index Recheck: 3,204,118`. The plan looks like an index scan and behaves like a bad seq scan. **Symptom:** medium-selectivity queries with erratic latency. **Fix:** lower selectivity expectation by adding a better predicate, or accept a seq scan, or increase `work_mem` locally.
+
+**11.6 — Index bloat drift.** An index on a churning column grows to 4× its live size because `VACUUM` lags. Index scans now read 4× the pages, and the buffer pool holds garbage. **Symptom:** slow, *gradual* degradation over weeks with no code change. **Fix:** monitor `pg_stat_user_indexes` and bloat estimates; `REINDEX CONCURRENTLY` in a maintenance window.
+
+**11.7 — Migration removed the index.** A migration recreates a table without its indexes, or a `DROP INDEX` intended for staging ran in production. Nothing errors; queries just get slower. **Symptom:** latency jump exactly at deploy time. **Fix:** index definitions live in version-controlled migrations, and a CI check asserting production's index set matches the expected set.
+
+**11.8 — The plan that is right for the wrong reason.** A seq scan is genuinely faster for a 30 % predicate *today*, and someone "fixes" it with a hint. Data grows, the predicate becomes 2 %, and the pinned seq scan is now 100× slower with no warning. **Fix:** treat hints as debt with an expiry date, revisit when data volume changes by 2×.
+
+## 12. Alternatives
+
+| Instead of reading plans | You get | When it is the right call |
+|---|---|---|
+| **`auto_explain`** logging slow plans automatically | The plan attached to the incident, without asking anyone to reproduce it | Always on for statements over `auto_explain.log_min_duration` — this is the single highest-value observability change for a database |
+| **`pg_stat_statements`** ranked by total time | Where the *aggregate* time goes, not just the slowest call | First step in any performance investigation: fixing the #1 query by total time beats fixing ten rare ones |
+| **Query rewriting (sargability)** | A usable index without any schema change | Whenever a function, cast or `OR` hides an index |
+| **Materialised view / summary table** | Removes the expensive shape rather than optimising it | The query is inherently an aggregate over many rows (Lesson 56) |
+| **Column store (Phase 3, L58)** | Analytics without indexes at all | Analytic predicates over huge scans |
+| **Application cache (Phase 2, L28–29)** | Removes the query from the path | Read-heavy, staleness-tolerant data |
+| **Read replica** | Moves the load off the primary | Reporting load that is already well-planned |
+| **Partitioning** | Makes the scan smaller via pruning | Time-series tables where queries always filter on time |
+| **`pg_hint_plan`** | Forces a shape now | Emergency only, tracked, revisited |
+
+## 13. When to use it
+
+- **Before creating any index, always.** One `EXPLAIN ANALYZE` costs 30 seconds and routinely shows that the index you were about to add would never be chosen.
+- **When latency is unexplained and the query is simple.** Simple query + slow = plan problem, essentially always.
+- **When estimates are suspect** — after bulk loads, after backfills, after a big tenant onboards, after a schema change.
+- **When planning capacity.** `Buffers: read=` tells you how much I/O a page view genuinely costs; that number feeds the cache hit-ratio and replica-sizing arithmetic (Phase 2, L26–27).
+- **In code review, for any new query on a table over ~1 M rows.** A plan pasted into the PR is worth more than a comment saying "should be fast".
+- **Before and after every index change**, so the claimed benefit is measured rather than assumed.
+
+## 14. When *not* to use it
+
+- **On tables with a few thousand rows.** A seq scan of 500 pages is fine; the planner knows; you are wasting time.
+- **As a substitute for fixing the access pattern.** If the query joins 11 tables because the schema is denormalised wrongly (Lesson 56), no plan will save it.
+- **To chase microseconds on a query that runs 4 times an hour.** Rank by `pg_stat_statements` total time, not by single-call latency.
+- **`EXPLAIN ANALYZE` on writes, in production, casually.** It executes. It can hold locks, fire triggers, and produce a 40-second `DELETE`. Wrap it in `BEGIN; ... ROLLBACK;` and know what the side effects are.
+- **As a security boundary.** Plans are not a substitute for constraints; an index does not enforce anything (Lesson 41).
+- **When the answer is obviously "this is an analytic query on the OLTP primary"** (Lesson 57) — the fix is architectural, not a plan tweak.
+
+## 15. Common mistakes
+
+1. **Adding an index without reading the plan first.** The index is created, the query stays slow, and now writes are slower too. Two costs, no benefit.
+2. **Reading `cost=` as milliseconds.** Cost units are relative. `cost=1,357,422` might be 3.8 s or 400 ms depending on the host, and only `actual time` is time.
+3. **Ignoring the estimate-vs-actual ratio.** The `rows=`/`actual rows=` discrepancy *is* the diagnosis for most bad plans; skipping it means treating symptoms.
+4. **`EXPLAIN` without `ANALYZE` and calling it done.** Estimates are the planner's opinion; you need its result.
+5. **Forgetting `BUFFERS`.** Without it you cannot tell 27 buffer hits from 732,410 disk reads — the difference between fast and catastrophic.
+6. **Blaming the planner for their own cast.** `WHERE bigint_col = $1::text` is the single most common self-inflicted seq scan in application code.
+7. **`random_page_cost = 4.0` on SSD.** A config error that silently caps index usage for the life of the instance.
+8. **Creating indexes and expecting them to be used by `LIKE '%term%'`.** Leading wildcards cannot use a B-tree; you need a trigram or full-text index (Lesson 47).
+9. **Indexing every foreign key and calling it a strategy.** Some FK indexes are load-bearing (cascade deletes, joins), some are pure write cost. Each needs a query that wants it.
+10. **`enable_seqscan = off` globally** to "fix" a plan. It does not forbid seq scans; it makes them cost 10^10, so the planner picks absurd plans when a seq scan genuinely was right.
+11. **Never running `VACUUM`, then wondering why the Index Only Scan still reads the heap** (`Heap Fetches:` is the tell).
+12. **Treating a plan as permanent.** Plans are a function of data distribution. Re-check after a 2× data change or a major version upgrade (the planner changes between versions).
+
+## 16. Interview perspective
+
+**What is actually being tested.** Not whether you can recite the cost constants. Interviewers are checking whether you can **diagnose rather than guess**: do you know that a slow query has a *cause* you can observe, that `EXPLAIN ANALYZE` plus an estimate/actual comparison localises it, and that an index is a budgeted resource with a write cost. The second thing being tested is whether you can tell the difference between "bad plan" and "inherently expensive query" — because the fixes are completely different.
+
+**Answers that land well:**
+
+- *"This query is slow. What do you do?"* — "I'd get the plan with `EXPLAIN (ANALYZE, BUFFERS)`, check the access path on the largest table, compare estimated to actual rows, and look at where the buffers were actually read. In my experience that splits into three cases: an unusable index (function or cast on the column), a bad estimate (stale stats or correlated predicates), or a genuinely expensive query shape that needs denormalisation or an analytic store."
+- *"Would you add an index here?"* — "Only after the plan shows the query is slow *with* an optimal access path. Then I'd price it: at 5,000 writes/sec and 6 existing indexes, one more index is ~20 % more WAL and a RAM budget, so it needs to save real read time. If it's for a hot subset, I'd use a partial index so writes to terminal rows don't pay."
+- *"The query is fast in psql and slow in the app."* — "That's almost always the plan, not the data: either a prepared statement switched to a generic plan at execution six, or the app binds a parameter with a type that forces an implicit cast on the column and disables the index. Both are visible in `EXPLAIN (ANALYZE, BUFFERS)`."
+- Volunteering **"what does the estimate look like versus reality?"** early signals real production experience, because it is the first thing an experienced engineer types.
+
+**Common interview tasks:** read a plan aloud and find the problem; explain why an index is not being used given five possible reasons; compute whether an index is worth its write cost; explain the difference between `EXPLAIN` and `EXPLAIN ANALYZE`; decide between an index, a materialised view and a cache for a given query; explain why `SELECT *` defeats a covering index.
+
+**Red flags interviewers watch for:**
+
+- "Add an index" as a first response, with no plan and no selectivity estimate.
+- Not knowing what `EXPLAIN ANALYZE` does differently from `EXPLAIN`.
+- Treating cost as time, or thinking a high cost number is itself a bug.
+- Being unable to name even two reasons a B-tree index would not be used.
+- Believing indexes are free, or that more indexes are strictly better.
+- Saying "the optimizer is broken" for a bad plan — the planner is usually right about the *data it was told about*.
+- Confusing "the index does not exist" with "the index was not chosen". Different bugs, different fixes.
+- No mention of measuring the before/after, so there is no way to know if the change helped.
+
+## 17. Knowledge check
+
+**Conceptual**
+
+1. A query on a 50 M-row table with a perfectly matching index is answered by a sequential scan. Give four distinct reasons this can happen, and for each state the one observation in `EXPLAIN` output that would identify it.
+2. Explain why `EXPLAIN` (no `ANALYZE`) can show a plan that is *plausible* while the real cause of slowness is invisible, and describe the specific comparison that `EXPLAIN ANALYZE` enables. Why is a 10× estimate-to-actual discrepancy more useful than a large `cost=` number?
+3. Two updates touch the same row: one changes `total_pence`, one changes `status`, and `status` has just been indexed. Explain why adding that single index slows down *both* updates, using the term **HOT update**. Then explain when `CREATE INDEX ... WHERE` would have avoided the cost.
+
+**Practical scenario**
+
+4. BookNook's admin "orders by status" screen queries `WHERE status = $1 ORDER BY created_at DESC LIMIT 50` on the 50 M-row `orders` table. 91 % of rows are `delivered`, 6 % are `shipped`, 2 % `paid`, and the remainder are terminal. The screen has a default view (all statuses, newest first) and per-status tabs. Ingest is 5,000 inserts/sec, and each order changes status about 7 times. Design the indexing for this screen end to end: the exact index definitions, which queries each serves, the approximate size and write cost of each, what you would *not* index and why, and how you would verify the design with plans before shipping it.
+
+**Calculation**
+
+5. A table has 20,000,000 rows of 100 bytes each, 8 KB pages, `random_page_cost = 4.0`, `seq_page_cost = 1.0`, `cpu_tuple_cost = 0.01`, `cpu_operator_cost = 0.0025`. A query returns 1 % of the rows. Calculate (a) the sequential-scan cost; (b) the index-scan cost assuming 200 index entries per leaf page and one random heap fetch per matching row; (c) which the planner chooses; (d) the same comparison with `random_page_cost = 1.1`; and (e) the crossover selectivity under both settings.
+
+6. BookNook writes 5,000 orders/sec, each row 120 bytes, with 6 secondary indexes of 32 bytes per entry. Assuming WAL ≈ 2× data bytes, calculate (a) the daily WAL volume; (b) the same with 8 indexes; (c) the resulting percentage increase; and (d) if WAL is archived to object storage at ₹0.023/GB/month with a 30-day retention, the monthly cost difference between the two index counts.
+
+**Progress checklist**
+
+- Phase 1 — Foundations (Lessons 1–17): **complete** ✅
+- Phase 2 — Scaling (Lessons 18–39): **complete** ✅
+- Phase 3 — Data and Storage:
+  - [x] Topic 1 — Relational databases (L40)
+  - [x] Topic 2 — Tables, keys, relationships, joins, constraints (L41)
+  - [x] Topic 3 — SQL versus NoSQL (L42)
+  - [x] Topic 4 — Key-value databases (L43)
+  - [x] Topic 5 — Document databases (L44)
+  - [x] Topic 6 — Wide-column databases (L45)
+  - [x] Topic 7 — Graph databases (L46)
+  - [x] Topic 8 — Search engines and full-text indexes (L47)
+  - [x] Topic 9 — Selecting a database from access patterns (L48)
+  - [x] Topic 10 — ACID transactions (L49)
+  - [x] Topic 11 — Isolation levels (L50)
+  - [x] Topic 12 — Dirty/non-repeatable/phantom reads, lost updates (L51)
+  - [x] Topic 13 — Optimistic versus pessimistic concurrency control (L52)
+  - [x] Topic 14 — Database indexes (L53)
+  - [x] Topic 15 — B-tree, hash, composite, covering, secondary indexes (L54)
+  - [x] **Topic 16 — Query plans and index trade-offs (L55) ← you are here**
+  - [ ] Topic 17 — Normalisation and denormalisation (L56)
+  - [ ] Topic 18 — OLTP versus OLAP (L57)
+  - [ ] Topic 19 — Data warehouses, data lakes, lakehouses (L58)
+  - [ ] Topic 20 — CAP theorem (L59)
+  - [ ] Topic 21 — PACELC (L60)
+  - [ ] Topic 22 — Consistency models (L61)
+  - [ ] Topic 23 — Object, block, and file storage (L62)
+  - [ ] Topic 24 — Data retention, archival, backups, disaster recovery (L63)
+
+**NEXT LESSON: Phase 3, Topic 17 — Database normalisation and denormalisation**
+
+---

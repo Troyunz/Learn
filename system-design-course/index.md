@@ -23,9 +23,9 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | Phase | Topics | Lessons | Status |
 |---|---|---|---|
 | 1 — Internet & system-design foundations | 17 | 1–17 | ✅ Complete |
-| 2 — Scaling | 22 | 18–39 | ✅ Lessons complete, wrap-up pending |
-| 3 — Data & storage | 24 | 40–63 | ⏳ In progress |
-| 4 — Distributed systems | 29 | 64–92 | ⏳ Not started |
+| 2 — Scaling | 22 | 18–39 | ✅ Complete |
+| 3 — Data & storage | 24 | 40–63 | ✅ **Complete (L55, L59, L63 added; wrap-up done)** |
+| 4 — Distributed systems | 29 | 64–92 | ⏳ In progress — L64–66 done |
 | 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ Not started |
 
 ## Files
@@ -41,7 +41,18 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | [phase-2-part-2.md](./phase-2-part-2.md) | 23–26 | LB strategies, health checks & failover, reverse proxies & gateways, caching fundamentals |
 | [phase-2-part-3.md](./phase-2-part-3.md) | 27–30 | Cache hierarchy, caching patterns, invalidation & TTL, stampedes/hot keys/eviction |
 | [phase-2-part-4.md](./phase-2-part-4.md) | 31–34 | CDNs & edge caching, replication, sync vs async replication, replication lag |
-| [phase-2-part-5.md](./phase-2-part-5.md) | 35–39 | Sharding, sharding strategies, resharding & cross-shard queries, consistent hashing, autoscaling & multi-region |
+| [phase-2-part-5.md](./phase-2-part-5.md) | 35–39 + wrap-up | Sharding, sharding strategies, resharding & cross-shard queries, consistent hashing, autoscaling & multi-region, Phase 2 wrap-up |
+| [phase-3-part-1.md](./phase-3-part-1.md) | 40–43 | Relational databases, tables/keys/joins/constraints, SQL vs NoSQL, key-value stores |
+| [phase-3-part-2.md](./phase-3-part-2.md) | 44–47 | Document stores, wide-column stores, graph databases, search engines |
+| [phase-3-part-3.md](./phase-3-part-3.md) | 48–51 | Selecting a database, ACID, isolation levels, read anomalies |
+| [phase-3-part-4.md](./phase-3-part-4.md) | 52–55 | Optimistic vs pessimistic concurrency, indexes, index types, **query plans & index trade-offs** |
+| [phase-3-part-5.md](./phase-3-part-5.md) | 56–63 + wrap-up | Normalisation, OLTP vs OLAP, warehouses/lakes/lakehouses, **CAP**, PACELC, consistency models, storage types, **backup & DR**, Phase 3 wrap-up |
+| [phase-4-part-1.md](./phase-4-part-1.md) | 64–66 | Phase 4 intro, why distribution is hard, partial failures & partitions, clocks & ordering |
+| phase-4-part-2.md | 67–69 | Sync vs async workflows, message queues, pub/sub — *not yet written* |
+| phase-4-part-3.md | 70–72 | Event streams, queues vs logs, consumer groups — *drafted, unmerged* |
+| phase-5-part-*.md | 93–106 | The 14 full system designs — *not started* |
+
+> **Note on `_chunks/`**: this directory holds raw generation output, including draft lessons 67, 70, 73 and 85 that have not yet been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
 
 ## Progress checklist
 
@@ -67,7 +78,7 @@ Legend: `[x]` complete · `[ ]` not started
 - [x] 17. Idempotency, retries, timeouts, exponential backoff — L17
 - [x] Phase 1 wrap-up
 
-### Phase 2 — Scaling
+### Phase 2 — Scaling ✅
 - [x] 1. Vertical scaling — L18
 - [x] 2. Horizontal scaling — L19
 - [x] 3. Stateless application servers — L20
@@ -90,37 +101,65 @@ Legend: `[x]` complete · `[ ]` not started
 - [x] 20. Resharding, hot partitions, cross-shard queries — L37
 - [x] 21. Consistent hashing and virtual nodes — L38
 - [x] 22. Autoscaling and multi-region architecture — L39
-- [ ] Phase 2 wrap-up
+- [x] Phase 2 wrap-up
 
-### Phase 3 — Data and storage
-- [ ] 1. Relational databases — L40
-- [ ] 2. Tables, keys, relationships, joins, constraints — L41
-- [ ] 3. SQL versus NoSQL — L42
-- [ ] 4. Key-value databases — L43
-- [ ] 5. Document databases — L44
-- [ ] 6. Wide-column databases — L45
-- [ ] 7. Graph databases — L46
-- [ ] 8. Search engines and full-text indexes — L47
-- [ ] 9. Selecting a database from access patterns — L48
-- [ ] 10. ACID transactions — L49
-- [ ] 11. Isolation levels — L50
-- [ ] 12. Dirty reads, non-repeatable reads, phantom reads, lost updates — L51
-- [ ] 13. Optimistic versus pessimistic concurrency control — L52
-- [ ] 14. Database indexes — L53
-- [ ] 15. B-tree, hash, composite, covering, secondary indexes — L54
-- [ ] 16. Query plans and index trade-offs — L55
-- [ ] 17. Normalisation and denormalisation — L56
-- [ ] 18. OLTP versus OLAP — L57
-- [ ] 19. Data warehouses, data lakes, lakehouses — L58
-- [ ] 20. CAP theorem — L59
-- [ ] 21. PACELC — L60
-- [ ] 22. Strong, eventual, causal, read-your-writes, monotonic consistency — L61
-- [ ] 23. Object, block, and file storage — L62
-- [ ] 24. Data retention, archival, backups, disaster recovery — L63
-- [ ] Phase 3 wrap-up
+### Phase 3 — Data and storage ✅
+- [x] 1. Relational databases — L40
+- [x] 2. Tables, keys, relationships, joins, constraints — L41
+- [x] 3. SQL versus NoSQL — L42
+- [x] 4. Key-value databases — L43
+- [x] 5. Document databases — L44
+- [x] 6. Wide-column databases — L45
+- [x] 7. Graph databases — L46
+- [x] 8. Search engines and full-text indexes — L47
+- [x] 9. Selecting a database from access patterns — L48
+- [x] 10. ACID transactions — L49
+- [x] 11. Isolation levels — L50
+- [x] 12. Dirty reads, non-repeatable reads, phantom reads, lost updates — L51
+- [x] 13. Optimistic versus pessimistic concurrency control — L52
+- [x] 14. Database indexes — L53
+- [x] 15. B-tree, hash, composite, covering, secondary indexes — L54
+- [x] 16. Query plans and index trade-offs — L55 ✳ *(written 2026-10)*
+- [x] 17. Normalisation and denormalisation — L56
+- [x] 18. OLTP versus OLAP — L57
+- [x] 19. Data warehouses, data lakes, lakehouses — L58
+- [x] 20. CAP theorem — L59 ✳ *(written 2026-10)*
+- [x] 21. PACELC — L60
+- [x] 22. Strong, eventual, causal, read-your-writes, monotonic consistency — L61
+- [x] 23. Object, block, and file storage — L62
+- [x] 24. Data retention, archival, backups, disaster recovery — L63 ✳ *(written 2026-10)*
+- [x] Phase 3 wrap-up
 
 ### Phase 4 — Distributed systems (L64–L92)
-- [ ] 1–29 — not started
+- [x] 1. Why distributed systems are difficult — L64
+- [x] 2. Partial failures and network partitions — L65 ✳ *(written 2026-10)*
+- [x] 3. Clock differences and ordering events — L66 ✳ *(written 2026-10)*
+- [ ] 4. Synchronous versus asynchronous workflows — L67 *(draft in `_chunks`)*
+- [ ] 5. Message queues — L68
+- [ ] 6. Publish-subscribe systems — L69
+- [ ] 7. Event streams — L70 *(draft in `_chunks`)*
+- [ ] 8. RabbitMQ-style queues versus Kafka-style logs — L71
+- [ ] 9. Consumer groups, partitions, offsets and ordering — L72
+- [ ] 10. At-most-once, at-least-once and exactly-once semantics — L73 *(draft in `_chunks`)*
+- [ ] 11. Idempotent consumers and deduplication — L74
+- [ ] 12. Dead-letter queues and retry queues — L75
+- [ ] 13. Backpressure and load shedding — L76
+- [ ] 14. Circuit breakers, bulkheads and graceful degradation — L77
+- [ ] 15. Distributed locks and leases — L78
+- [ ] 16. Leader election — L79
+- [ ] 17. Quorums — L80
+- [ ] 18. Consensus and Raft — L81
+- [ ] 19. Distributed transactions — L82
+- [ ] 20. Two-phase commit — L83
+- [ ] 21. Saga pattern — L84
+- [ ] 22. Transactional outbox and change data capture — L85 *(draft in `_chunks`)*
+- [ ] 23. Monoliths, modular monoliths and microservices — L86
+- [ ] 24. Service discovery and configuration management — L87
+- [ ] 25. Observability: logs, metrics, traces — L88
+- [ ] 26. SLIs, SLOs and error budgets — L89
+- [ ] 27. High availability and disaster recovery — L90
+- [ ] 28. Active-passive versus active-active — L91
+- [ ] 29. RTO and RPO — L92
 - [ ] Phase 4 wrap-up
 
 ### Phase 5 — Complete system-design exercises (L93–L106)
@@ -128,7 +167,10 @@ Legend: `[x]` complete · `[ ]` not started
 - [ ] 5. Search autocomplete · 6. File storage · 7. Web crawler · 8. Real-time chat
 - [ ] 9. News feed · 10. Video streaming · 11. Ride sharing · 12. E-commerce/inventory
 - [ ] 13. Payment processing · 14. Metrics and logging platform
+- [ ] Phase 5 wrap-up
 
 ---
 
-**NEXT: Phase 2 wrap-up, then Phase 3, Topic 1 — Relational databases**
+**NEXT: Phase 4, Topic 4 — Synchronous versus asynchronous workflows (L67), then Topic 5 — Message queues (L68)**
+
+For the precise state of every file — including orphaned drafts, stale inline checklists, and the remaining work plan — see [../AUDIT.md](../AUDIT.md).
