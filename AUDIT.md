@@ -81,7 +81,7 @@ Every new lesson follows the course's 17-section template and the BookNook examp
 
 ## 4. Remaining work
 
-### 4.1 Phase 4 — 21 lessons to write, 4 drafts to merge
+### 4.1 Phase 4 — 22 lessons to write, 4 drafts to merge, 1 wrap-up
 
 Existing content to merge (drafts in `_chunks/`, complete, 17-section, BookNook-consistent):
 
