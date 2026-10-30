@@ -12,7 +12,7 @@
 | 2 — Scaling | 18–39 + wrap-up | ✅ Complete (index wrongly said "wrap-up pending") | ✅ Complete |
 | 3 — Data & storage | 40–63 + wrap-up | ⚠️ **3 lessons missing** (L55, L59, L63), wrap-up written but referenced the missing lessons | ✅ **Complete** |
 | 4 — Distributed systems | 64–92 + wrap-up | ⚠️ 5 of 29 lessons existed as **unmerged drafts** (L64, 67, 70, 73, 85) in `_chunks/` | ✅ **Complete**: L64–92 + wrap-up written and merged; all drafts consumed |
-| 5 — Design exercises | 93–106 + wrap-up | ❌ Nothing | 🔄 **6 of 14 done**: L93–98 (Pastebin, shortener, rate limiter, notifications, autocomplete, file storage) |
+| 5 — Design exercises | 93–106 + wrap-up | ❌ Nothing | 🔄 **9 of 14 done**: L93–101 |
 
 **Course body before:** 54,581 lines / ~2.9 MB. **Added in this pass:** 4 lessons (L55, L59, L63, L65, L66) plus a phase file structure — see `git log`.
 
@@ -120,7 +120,8 @@ Proposed part-file layout (5–6 lessons per file, matching the Phase 1–3 conv
 |---|---|---|
 | `phase-5-part-1.md` ✅ | 93 Pastebin · 94 URL shortener · 95 Rate limiter | done |
 | `phase-5-part-2.md` ✅ | 96 Notifications · 97 Autocomplete · 98 File storage | done |
-| remaining | 99 crawler · 100 chat · 101 news feed · 102 video · 103 ride sharing · 104 e-commerce · 105 payments · 106 metrics platform | 8 designs + wrap-up |
+| `phase-5-part-3.md` ✅ | 99 Crawler · 100 Chat · 101 News feed | done |
+| remaining | 102 video · 103 ride sharing · 104 e-commerce · 105 payments · 106 metrics platform | 5 designs + wrap-up |
 
 Each design should follow the course's Phase 5 template (requirements → capacity estimation → API → data model → high-level design → deep dives → bottlenecks → evolution). Order: Pastebin, URL shortener, rate limiter, notification service, search autocomplete, file storage, web crawler, real-time chat, news feed, video streaming, ride sharing, e-commerce/inventory, payment processing, metrics & logging.
 
