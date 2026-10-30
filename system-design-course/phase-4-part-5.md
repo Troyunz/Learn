@@ -1363,3 +1363,1452 @@ BookNook product page: 1,200 rps, 200-thread pool, recommendations `p99 = 300 ms
 **NEXT LESSON: Phase 4, Topic 15 — Distributed locks and leases**
 
 ---
+
+---
+
+# Lesson 78 — Distributed Locks and Leases
+
+*Phase 4, Topic 15*
+
+## 1. Simple definition
+
+A **distributed lock** is an agreement, mediated by a third party, that at most one process performs a particular action at a time — across machines that share no memory.
+
+A **lease** is a lock with an **expiry**: the holder may hold it only until a stated time, after which it is automatically released and may be granted to someone else. Leases exist because locks held by processes that crash never get released, and a distributed lock without expiry is a deadlock generator.
+
+A **fencing token** is a monotonically increasing number issued with each grant of a lease. The protected resource remembers the highest token it has seen and **rejects any write with a lower one**. This is what makes leases *safe* rather than merely convenient, and it is the single most important idea in this lesson:
+
+> **A lease alone does not prevent two holders from acting at once. It only makes that overlap rare. A fencing token is what makes the overlap harmless.**
+
+Terms defined before use:
+
+- **Mutual exclusion (mutex)**: at most one holder in the critical section.
+- **Critical section**: the work done while holding the lock.
+- **TTL (time to live)**: how long a grant is valid before it is presumed abandoned.
+- **Renewal / heartbeat**: extending the lease before it expires (`TTL/3` is the usual cadence).
+- **Liveness failure**: nobody can acquire the lock (crash without TTL, or a lock service outage).
+- **Safety failure**: two holders act at once (expiry during a long pause — §4.6).
+- **Herd / thundering herd**: many waiters all retrying the instant a lock frees (§4.9).
+- **Optimistic concurrency**: no lock at all — a version or ETag checked at write time (`UPDATE ... WHERE version = n`). The correct default, and vastly cheaper.
+
+The one sentence to carry out of this lesson: **prefer not to need a lock; if you need one, make it a lease with a fencing token; and if you find yourself guarding a database write with a Redis lock, you have probably found a simpler answer wearing a complicated costume.**
+
+## 2. Why it exists
+
+Some work must genuinely happen **once**, not once-per-instance:
+
+- A nightly invoice run must execute on one node, not eight (§7.1).
+- A flash-sale counter must not oversell its last 40 units to 300 simultaneous buyers.
+- A compaction or reindex job must not run concurrently with itself.
+- A single-use coupon code must be redeemed exactly once across the fleet.
+- Only one node may act as the scheduler for a job queue (this is leader election, L79 — the same primitive).
+
+Without shared memory, the obvious `if not already_running:` check in one process is useless: every replica's flag says "not running".
+
+BookNook had exactly this problem, cheaply fixable and expensively unfixed. Its nightly invoice job was triggered by **cron on every web node** — three nodes, so **three invoice emails** per customer, every night, for 11 days. The "fix" was to move the cron to one node; then that node was replaced by the autoscaler during the night, and invoices were not sent at all for **two** nights. The real fix was a distributed lease: one holder, expiry-based recovery if the holder dies, and a fencing token so the "recovery" could never produce a duplicate send.
+
+Why this is genuinely hard, in a way a single-process mutex is not — four independent hazards:
+
+1. **Processes pause.** A GC pause, a VM live-migration, a slow syscall, or a `SIGSTOP` can freeze a holder for seconds. The holder does not know it has been frozen; when it wakes, its lease may have been granted to someone else (§4.6). This is *the* core problem and no lock service can solve it for you — only fencing can.
+2. **Clocks are wrong** (L66). A lease's expiry is a wall-clock judgement, so clock skew between the lock service and the holder creates windows where both believe they hold it.
+3. **Networks partition** (L65). The holder cannot renew; the service cannot tell "holder is dead" from "network is broken". Both choices are wrong: releasing risks two holders; not releasing risks deadlock.
+4. **The lock is the wrong tool more often than people expect.** Most "I need a distributed lock" cases are better served by idempotency (L74), partition ownership (L72), database constraints, or optimistic concurrency — and those have none of the four hazards above (§4.7).
+
+The characteristic symptom of the naive lock: **it works in testing, works for months in production, and then produces one duplicated charge, one double-sent email, or one oversold item — during a GC pause or a network blip, which is when you least want to debug it.** That is why this lesson spends more effort on *fencing* than on *acquiring*.
+
+## 3. Real-world analogy
+
+**The office meeting room with a numbered booking sheet.**
+
+There is one room. A whiteboard on the door says "Booked by Alice, 2–3 p.m." Anyone arriving sees the note and waits. That is a lock, and it works fine — until the failure cases arrive, and each one has a real-world counterpart:
+
+**Failure 1 — the holder forgets to erase the board.** Alice leaves at 3 p.m. but never wipes the whiteboard. Now the room appears booked forever, and nobody uses it. This is the **lock without a TTL**, and it is why leases exist: the note says "2–3 p.m.", so at 3:01 the room is presumed free regardless of what Alice did.
+
+**Failure 2 — Alice's watch is slow, and she stays until 3:20.** Bob reads the sheet, sees 3 p.m., enters at 3:05 — and now two people are in the room. **The expiry produced two holders.** No amount of careful note-writing fixes this, because Alice genuinely believed she had until 3 p.m. *by her own watch*. This is the GC pause, and it is unavoidable.
+
+**Failure 3 — the receptionist's numbered booking sheet.** The room's actual bookings are recorded at reception, and each booking gets a sequential number: Alice's is **#41**, Bob's is **#42**. The projector in the room has a rule: it accepts a "start meeting" command only with a number **higher than the last one it saw**. When Bob enters at 3:05 with **#42**, the projector accepts his commands and thereafter *ignores* Alice's **#41** — so even though Alice is still in the room, she cannot change the slides, book the projector, or take the minutes. Her stale hold becomes **harmless**.
+
+That **numbered booking sheet is the fencing token**, and it is the only one of the three fixes that actually works. The TTL bounds how long badness can continue; the fencing token prevents the badness from mattering at all.
+
+One more property from the analogy worth keeping: **a lock is a poor fit for a big room with 50 chairs.** If 50 people arrive, serially admitting them through one booking is absurd — you would just let them share the room. That is §4.7's point about avoiding locks entirely: sometimes "exclusive access" is the wrong requirement, and restructuring the work removes the need for the lock.
+
+## 4. Detailed technical explanation
+
+### 4.1 What a distributed lock must provide — four properties
+
+| Property | Meaning | What breaks it |
+|---|---|---|
+| **Mutual exclusion (safety)** | ≤ 1 holder in the critical section | Lease expiry during a pause; split-brain from a partition; a lock service that gives up its data |
+| **Liveness** | A holder can eventually be displaced | No TTL; a crashed holder; a lock service with an unbeatable waiter |
+| **Fault tolerance** | Survives holder crashes | TTL + renewal is the mechanism |
+| **Safety *under expiry*** | A stale holder cannot corrupt state | **Fencing tokens — and nothing else** |
+
+The fourth is the one that distinguishes production-grade designs. It is also the one that cannot be provided by the lock service alone: it requires the **protected resource** to participate (by rejecting stale tokens). Any design that stops at "acquire, do work, release" is a design with a latent double-writer bug.
+
+### 4.2 Redis: the common implementation, and its exact limits
+
+```
+  ACQUIRE:   SET lock:invoice <token> NX PX 30000
+             NX = only if absent (mutual exclusion)
+             PX = expiry in ms (the lease)
+             <token> = a random UUID identifying THIS holder
+
+  RELEASE:   if redis.call('GET', lock:invoice) == token then
+                 return redis.call('DEL', lock:invoice)
+             end                                  ← MUST be a Lua script:
+             -- a plain GET-then-DEL has a race in which you delete
+             -- someone else's lock (§15.5)
+```
+
+Two things Redis does **not** give you, which are routinely assumed:
+
+- **A monotonically increasing token.** `SET NX` returns a random UUID, so there is no ordering to fence with. If you need fencing from Redis, use `INCR` to mint the token (the counter *is* the sequence), and never reset it.
+- **Safety across clock jumps or pauses.** A holder whose process freezes for longer than `PX` loses the lease while believing it holds it. On a single Redis node this is a genuine safety hole; nothing about the protocol fixes it.
+
+**Redlock** (acquiring from N=5 independent Redis masters, a majority required) is often presented as the fix. It improves *availability* and reduces the chance of two grants, but it does not remove the fundamental hazard: **a holder that pauses after acquiring still acts after its lease expires**, and no quorum of lock servers can stop it, because the pause happens in the holder's own process. Redlock is a reasonable way to make the *lock service* survive node failures; it is not a substitute for fencing (§15.6).
+
+### 4.3 Consensus-backed locks: ZooKeeper and etcd
+
+The lock service is itself a replicated, consistent store (L81), which changes the guarantees materially.
+
+```
+ ZooKeeper:
+   create /locks/invoice/lock-0000000041  (EPHEMERAL_SEQUENTIAL)
+   the lowest sequence number holds the lock
+   others watch the node immediately before theirs (NOT the parent — that
+   would be a herd, §4.9)
+   EPHEMERAL nodes vanish when the session dies → automatic release on crash
+
+ etcd:
+   lease = ttl(30s); put /lock/invoice "holder-A" --lease=<id>
+   renewal = keepalive on the lease
+   the store's MVCC REVISION is the fence: it increases monotonically with
+   every write, so the revision of your grant is a valid fencing token
+```
+
+| Property | Redis (`SET NX PX`) | ZooKeeper / etcd |
+|---|---|---|
+| Mutual exclusion | Yes, on one node | Yes, via consensus |
+| Crash release | TTL only | TTL **and** session/ephemeral |
+| Fencing token available | Only via an explicit `INCR` | **Yes, natively** (zxid / revision) |
+| Waiter ordering / fairness | None (poll and retry) | Fair queue (sequential nodes) |
+| Cost per acquisition | ~0.3 ms | ~2–5 ms (consensus round) |
+| Availability if you need a majority | Single node | Requires a quorum (2 of 3, 3 of 5) |
+
+The cost difference — roughly **10× per acquisition** — is why Redis locks are popular. The correctness difference is why serious systems use the fence regardless of which service issued the lock.
+
+### 4.4 Database locks and lease tables
+
+Often the best answer, because the lock and the data it protects live in the same transactional boundary:
+
+```sql
+-- 1. Row lock (pessimistic). One row, one writer.
+BEGIN;
+SELECT * FROM stock WHERE sku='HP-4471' FOR UPDATE;   -- blocks other writers
+UPDATE stock SET qty = qty - 1 WHERE sku='HP-4471';
+COMMIT;
+
+-- 2. Claim work without blocking (the work-queue pattern).
+WITH claimed AS (
+  SELECT id FROM invoice_run
+   WHERE status='pending'
+     AND (locked_until IS NULL OR locked_until < now())   -- LEASE
+   ORDER BY id
+   LIMIT 50
+   FOR UPDATE SKIP LOCKED                                -- no blocking, no herd
+)
+UPDATE invoice_run SET status='running',
+       locked_until = now() + interval '60 seconds',
+       attempt = attempt + 1
+ WHERE id IN (SELECT id FROM claimed)
+RETURNING id;
+
+-- 3. An atomic conditional write — the answer to most "I need a lock" cases.
+UPDATE stock SET qty = qty - 1, version = version + 1
+ WHERE sku='HP-4471' AND qty >= 1 AND version = 7;
+-- 0 rows affected ⇒ someone else won; retry or report sold out.
+```
+
+`FOR UPDATE SKIP LOCKED` is worth calling out: it converts lock contention into **partitioned work assignment** — each worker claims different rows and nobody waits. It routinely outperforms a distributed lock by orders of magnitude (§9 step 2) and has no lease-safety hazard, because each row is claimed transactionally.
+
+### 4.5 Fencing: the mechanism that makes overlap harmless
+
+```
+  LOCK SERVICE                HOLDER                       PROTECTED STORE
+  ════════════                ══════                       ═══════════════
+  grant → token 41        A acquires
+                          A pauses (GC, 3.5 s > TTL 3 s)
+  lease expires
+  grant → token 42        B acquires
+                          B writes (token 42) ───────────► max_seen = 42 ✓
+                          A wakes up, still "believes" it
+                          holds the lock, writes (token 41) ► 41 < 42 → REJECT ✗
+
+  ⇒ A's stale hold is HARMLESS. This is the only mechanism that provides
+    safety under a pause, and it requires the STORE to enforce it.
+```
+
+Three rules for fencing to work:
+
+1. **The token must be monotonic and never reused** — a counter, a revision, a `zxid`. A UUID is not a fence.
+2. **Every write to the protected resource must carry it**, and the store must reject `token < max_seen`. A lock whose fence is not checked is decoration.
+3. **The token must be checked atomically** with the write — `UPDATE ... WHERE last_token < $1` in the same statement, not a separate read-then-check.
+
+### 4.6 Lease duration: the arithmetic that decides safety
+
+The lease must be **long enough that a healthy holder can renew, and short enough that a dead holder's work stops quickly**. The hazard is a **pause longer than the TTL**:
+
+```
+  TTL = 3 s, renewal every 1 s.
+  A stop-the-world GC pause of 3.5 s:
+      t=0.0  A renews (valid to 3.0)
+      t=0.5  A pauses
+      t=3.0  lease expires; the service grants to B (token 42)
+      t=4.0  A resumes, believing it holds the lock until 3.0 — which it
+             will only notice on its NEXT renewal attempt, at t≈4.0
+      t=4.0–? A performs the critical section with a stale token 41
+  ⇒ the overlap is not a theoretical possibility; it is a normal consequence
+    of a pause longer than the TTL.
+
+  SIZING: TTL ≥ 3 × (max expected pause + renewal RTT)
+      max GC pause 800 ms, RTT 5 ms → TTL ≥ 3 × 0.805 ≈ 2.4 s → use 3 s
+      with a 3.5 s outlier pause, safety comes from FENCING, not from a
+      bigger TTL (a bigger TTL only shortens the window in which a crash
+       leaves the resource idle — it never eliminates the pause hazard).
+```
+
+The design principle: **TTL controls how quickly a dead holder is replaced; fencing controls whether a paused holder can do damage. Do not try to make the TTL do both jobs.**
+
+### 4.7 Before you lock: the alternatives that do not have these problems
+
+| Need | Better than a distributed lock | Why |
+|---|---|---|
+| One job per night | **Leader election** (L79), or a cron on a single scheduler with a lease | The lock *is* leader election; build it once, properly |
+| No double-send / double-charge | **Idempotency** (L74) | Correct under any number of concurrent holders |
+| No oversell | **Atomic conditional UPDATE**, or a reservation row | The database already has the lock; use it |
+| Assign work to workers | **`FOR UPDATE SKIP LOCKED`**, or partition ownership (L72) | Contention becomes partitioning |
+| Serialise edits to a document | **Optimistic concurrency** (version/ETag) | Aborts only actual conflicts; no leases at all |
+| Rate-limit a shared resource | **Token bucket in a shared store** | No exclusion needed — only accounting |
+
+And the costs of locking, which are usually omitted from the design review:
+
+```
+  Lock acquisition serialises the work: throughput ≤ 1 / critical_section_duration.
+  If the section takes 40 ms, the ceiling is 25 operations/sec, no matter how
+  many workers you add. That is the real reason to avoid locks: they cap
+  throughput at the speed of the thing you are protecting.
+```
+
+### 4.8 Renewal, and what to do when renewal fails
+
+```
+  every TTL/3:
+      if renew(token) succeeds → continue the critical section
+      if renew(token) fails   → AMBIGUOUS (L65 §4.2):
+            the lease may have expired and been granted elsewhere.
+            ⇒ STOP IMMEDIATELY. Do not finish the work.
+            ⇒ Check whether the effect already happened (status query).
+            ⇒ Write nothing more with a stale token — the store will reject
+              it if fencing is in place, which is the point.
+```
+
+The most common bug here is a worker that logs "renewal failed" and *keeps working*, reasoning that the work is nearly done. That is precisely the case fencing catches, and precisely the case an un-fenced system corrupts.
+
+### 4.9 Contention, the herd, and fairness
+
+When many waiters want the same lock, the naive `while not acquire(): sleep(...)` produces:
+
+- **A retry herd**: all waiters wake at the same interval, hammering the lock service.
+- **Unfairness**: a random waiter wins, so a long-waiting worker can starve indefinitely.
+- **Wasted capacity**: each poll is a network round trip (0.3 ms at 1,000 waiters = 300 ms of lock-service time per cycle).
+
+Fixes: **full jitter** on the retry interval (L65 §8.3); **a fair queue** (ZooKeeper sequential nodes solve this properly); **batching the critical section** so fewer grants are needed; or, best, **making the lock unnecessary** by partitioning the work (§4.7).
+
+## 5. Request / data flow
+
+The invoice job, with a pause, a takeover, and fencing saving the day.
+
+```
+ ── NORMAL ─────────────────────────────────────────────────────────────────
+ t=02:00:00  node-1: SET lock:invoice-nov u=1 NX PX 30000 → OK, token=1
+             (production would mint token = INCR lockseq → 41)
+ t=02:00:10  node-1 renews (every 10 s = TTL/3) → OK
+ t=02:00:20  node-1 processing invoices (batch 1 of 4)
+ t=02:03:40  done; releases (compare-and-delete with token 41) ✓
+             ⇒ exactly one run. The other two nodes found the lock held and
+               exited immediately — no polling, no herd.
+
+ ── THE INCIDENT ───────────────────────────────────────────────────────────
+ t=02:00:00  node-1 acquires token 41, TTL 30 s → lease valid until 02:00:30
+ t=02:00:05  node-1 enters a 30-second stop-the-world pause (heap pressure)
+ t=02:00:10  the renewal that would have extended the lease never happens
+             (the process is frozen; it does not know this)
+ t=02:00:30  lease expires. node-2 acquires → token 42, valid until 02:01:00
+ t=02:00:31  node-2 begins batch 1
+ t=02:00:35  node-1 resumes. It still "believes" it holds the lease — its
+             last successful renewal said so — and it does not re-check.
+ t=02:00:35  node-1 writes invoice state with token 41
+             ── WITHOUT FENCING: both nodes write. Customers get two invoices,
+                and nothing in the system reports an anomaly.
+             ── WITH FENCING:
+                  storage: UPDATE ... WHERE last_token < 41 → 0 rows → REJECT
+                  node-1 receives a fencing rejection → aborts, logs, alerts.
+ t=02:00:36  node-1's next renewal fails (token 41 ≠ 42) → it stops cleanly.
+ t=02:01:00  node-2 completes all batches with token 42. Exactly one run. ✓
+
+ ── THE LESSON IN THE TIMELINE ─────────────────────────────────────────────
+  The lock did not prevent the overlap. The TTL made the overlap recoverable,
+  and the FENCE made it harmless. Three mechanisms, three different jobs.
+```
+
+## 6. ASCII diagram
+
+The lifecycle of a lease, including the failure branches:
+
+```
+                  ┌───────────────────────────────────────────┐
+                  │  acquire (SET NX PX / create ephemeral)   │
+                  └───────────────────┬───────────────────────┘
+                       success        │        lock held
+              ┌───────────────────────▼───────────────────────┐
+              │              HOLDING (token = 41)             │
+              │  renew every TTL/3 ──► keeps the grant alive  │
+              └───────┬───────────────────────────┬───────────┘
+        renew OK      │                           │  renew FAILS
+                      │                           ▼
+                      │                 ┌───────────────────┐
+                      │                 │ STOP. Do not finish│
+                      │                 │ Check the effect.  │
+                      │                 │ Fence rejects late │
+                      │                 │ writes.            │
+                      │                 └───────────────────┘
+                      │
+        work complete │                    process crashed / paused
+                      ▼                              │
+              ┌───────────────┐                      ▼
+              │ release with  │            lease EXPIRES after TTL
+              │ compare-and-  │                      │
+              │ delete(token) │                      ▼
+              └───────────────┘            re-grant with token 42
+                                              │
+                                              ▼
+                                     stale holder's writes (41)
+                                     are REJECTED by the store
+```
+
+The three orderings that decide whether the design is safe:
+
+```
+  ✗ UNSAFE                       ✓ SAFE-ISH                    ✓ SAFE
+  ─────────                      ──────────                    ──────
+
+  acquire                        acquire                       acquire
+  do work                        do work                       do work
+  release                   ┌──► renew ──► do work        ┌──► check fence
+  (no TTL, no fence)        │    release (no fence)        │    before each write
+                            │                              │    renew
+  a crash locks the         │    expiry can produce        │    release
+  resource forever; an      │    two writers, silently     │
+  expiry produces two       │                              └─ stale writes rejected,
+  writers that CORRUPT      └─ works until it doesn't        cost = one aborted job
+```
+
+## 7. Detailed example
+
+### 7.1 The flash sale: three implementations, one winner
+
+BookNook offers **500 units** of a signed edition. Traffic: **12,000 buy-clicks in 90 seconds ≈ 133/s**, peaking at **400/s**.
+
+**(a) Read-modify-write (no lock).** `SELECT qty; if qty>0: UPDATE qty=qty-1`. At 400/s with 30 ms of think time, dozens of requests read `qty=17` simultaneously and all decrement → **oversold by 60 units**, with 60 apologetic emails and a £4,200 goodwill cost.
+
+**(b) Redis lock around the critical section.**
+
+```
+  per request: SET NX PX 5000 (0.4 ms) → read (0.5 ms) → write (0.5 ms) → DEL
+  critical section ≈ 1.4 ms ⇒ ceiling = 1 / 0.0014 ≈ 714/s
+  at 400/s peak, utilisation of the lock = 400 × 0.0014 = 56 % → workable
+  BUT: 400/s × 0.4 ms = 160 ms/s of Redis time just for acquisition, and
+  any pause > 5 s TTL produces the §5 incident. Fencing required.
+```
+
+**(c) Atomic conditional UPDATE (no lock at all).**
+
+```sql
+UPDATE stock SET qty = qty - 1
+ WHERE sku='SIGNED-500' AND qty >= 1
+RETURNING qty;
+-- 0 rows ⇒ sold out. Serialised by the database's own row lock, inside one
+-- round trip. No lease, no TTL, no fence, no pause hazard.
+```
+
+Measured on BookNook's Postgres (one hot row):
+
+| Approach | Throughput | Oversell | Failure mode |
+|---|---|---|---|
+| Read-modify-write | 400/s | **60 units** | Silent corruption |
+| Redis lock, no fence | 400/s | 0 in tests, **2 in prod** during a pause | Rare, invisible |
+| Redis lock + fence | ~600/s | 0 | Aborted job on stale write |
+| **Atomic conditional UPDATE** | **~5,000/s** | **0** | None |
+| Reservation rows per unit | ~2,000/s | 0 | More rows, cleaner audit |
+
+The winner is (c) — **the same database that stores the counter already provides the lock, atomically, in one round trip, with no lease semantics to get wrong.** And where a hot row genuinely becomes the bottleneck (L72 §11.4), the fix is **sharding the counter** (500 units → 10 buckets of 50) rather than adding a distributed lock in front of it.
+
+### 7.2 Where a real lease is genuinely needed
+
+Not every case has a local database. BookNook's **search reindex** job:
+
+```
+  Requirements:
+    - must run on exactly one of 8 search workers
+    - takes 6–20 minutes (highly variable)
+    - if the holder dies mid-run, another must take over within 2 minutes
+    - writing partial state must not corrupt the index
+
+  Why a lease and not a DB constraint:
+    - the work spans 20 minutes, far beyond any sane transaction, so a row
+      lock would hold a connection open for 20 minutes (unacceptable)
+    - the index is an external system, so the "protected resource" cannot
+      enforce a database constraint; it enforces a FENCE instead.
+
+  Design:
+    lock: etcd lease TTL 60s, keepalive every 20s
+    fence: etcd revision of the grant (monotonically increasing)
+    index writes: PUT /index/segments?fence=NNNN
+                  index service rejects any fence < its max_seen
+    takeover: node dies → lease expires in ≤60 s → another node acquires with
+              a higher revision → its writes are accepted, the dead node's
+              would not be.
+    cost of a takeover: ≤60 s of duplicate-visible-but-ignored work.
+```
+
+The distinction from §7.1 is the deciding question: **can the protected resource enforce the exclusion itself?** If yes (the database row), use that and skip the whole lock apparatus. If no (an external index, a third-party API, a shared filesystem), use a lease **with a fence**, because that is the only mechanism that helps.
+
+## 8. Code or configuration example
+
+```python
+# ============================================================================
+# BookNook: a lease with a fencing token. Redis mints the fence explicitly
+# with INCR — a UUID is not a fence (§4.2).
+# ============================================================================
+
+class Lease:
+    def __init__(self, redis, name, ttl_s=30):
+        self.r, self.name, self.ttl = redis, name, ttl_s
+        self.token = None
+        self.renew_task = None
+
+    def acquire(self, wait_s=5) -> bool:
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            token = self.r.incr(f"{self.name}:seq")     # MONOTONIC fence
+            # SET NX PX: only if free, and with an expiry so a crash releases
+            if self.r.set(f"{self.name}:lock", token, nx=True, px=self.ttl * 1000):
+                self.token = token
+                return True
+            # FULL JITTER: without it, waiters form a synchronised herd (§4.9)
+            time.sleep(random.uniform(0, 0.05))
+        return False
+
+    def renew(self) -> bool:
+        # Compare-and-extend, atomically: only the holder may extend.
+        ok = self.r.eval("""
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+            end
+            return 0
+        """, 1, f"{self.name}:lock", self.token, self.ttl * 1000)
+        return bool(ok)
+
+    def release(self):
+        # Compare-and-delete: a plain DEL can delete SOMEONE ELSE'S lock (§15.5)
+        self.r.eval("""
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+        """, 1, f"{self.name}:lock", self.token)
+
+
+def run_job(lease: Lease, job):
+    if not lease.acquire(wait_s=0):        # cron job: do not wait, just skip
+        log.info("lock held elsewhere; skipping")
+        return
+    try:
+        deadline = time.monotonic() + lease.ttl / 3
+        for unit in job.units():
+            if time.monotonic() >= deadline:
+                if not lease.renew():
+                    # RENEWAL FAILED: the lease may now belong to someone else.
+                    # STOP. Do not finish. The fence protects us either way,
+                    # but continuing burns work that will be rejected (§4.8).
+                    log.error("lease lost; aborting job")
+                    metrics.incr("lease.lost")
+                    return
+                deadline = time.monotonic() + lease.ttl / 3
+
+            job.apply(unit, fence=lease.token)     # EVERY write carries it
+    finally:
+        lease.release()
+
+
+# --- The protected store enforces the fence (§4.5 rule 2) -------------------
+def apply_index_write(segment, fence: int):
+    with db.transaction() as tx:
+        row = tx.get_or_create("index_meta", id=1)
+        if fence < row.last_fence:
+            raise StaleFence(f"fence {fence} < {row.last_fence}")
+        tx.upsert("index_segments", segment)
+        row.last_fence = fence          # ATOMIC with the write, not separate
+```
+
+```sql
+-- --- Lease table in the database: no external service required -------------
+CREATE TABLE job_lease (
+  name         text PRIMARY KEY,
+  holder       text,
+  token        bigint NOT NULL DEFAULT 0,
+  locked_until timestamptz
+);
+
+-- Claim, atomically, minting a new monotonic fence on every grant.
+UPDATE job_lease
+   SET holder = $1,
+       token = token + 1,                            -- THE FENCE
+       locked_until = now() + interval '60 seconds'
+ WHERE name = 'reindex'
+   AND (locked_until IS NULL OR locked_until < now())
+RETURNING token;                                     -- 0 rows ⇒ someone holds it
+
+-- Renewal (only the holder can).
+UPDATE job_lease SET locked_until = now() + interval '60 seconds'
+ WHERE name='reindex' AND holder=$1 AND locked_until > now();
+
+-- The protected write checks the fence in the SAME statement.
+INSERT INTO index_segments (segment, fence)
+SELECT $1, $2 WHERE $2 >= (SELECT token FROM job_lease WHERE name='reindex');
+```
+
+```yaml
+# --- etcd: lease + keepalive, with the revision as the fence --------------
+# etcdctl lease grant 60        → lease 694d8b... (60 s TTL)
+# etcdctl put /locks/reindex holder-A --lease=694d8b...
+# etcdctl lease keep-alive 694d8b...      # every 20 s = TTL/3
+# The put's header.revision is monotonic and usable as a fencing token.
+```
+
+## 9. Numerical example
+
+BookNook's nightly invoice run: 125,000 customers, 3 web nodes on cron, 40 ms of work per customer if run serially.
+
+**Step 1 — the cost of not locking.**
+
+```
+  3 nodes × 125,000 invoices = 375,000 emails instead of 125,000
+  duplicate emails: 250,000/night
+  support cost at £0.35 per ticket, 2 % of recipients complain:
+      125,000 × 2 × 0.02 = 5,000 tickets/night = £1,750/night
+  ⇒ The 11-day incident cost ~£19,000 in support alone, plus churn.
+  The lock takes half a day to write. That is the whole business case.
+```
+
+**Step 2 — why the lock should not guard the *sends*, but the *batch claim*.**
+
+```
+  Serialising every invoice behind one lock:
+      critical section = 40 ms send → ceiling = 25 invoices/sec
+      125,000 invoices → 5,000 s = 83 minutes, and only ONE node works.
+  Claiming batches instead (FOR UPDATE SKIP LOCKED, batches of 500):
+      8 workers × concurrent claims, no blocking
+      measured: 5,000 claims/s → 125,000 invoices claimed in 25 s,
+      sends pipeline at 400/s (provider limit) → 313 s = 5.2 min total.
+  ⇒ 16× faster, and the "lock" is the row claim, which cannot produce two
+    holders of the same row at all.
+```
+
+**Step 3 — lease sizing against real pauses.**
+
+```
+  measured GC pauses p99 = 320 ms, max over 30 days = 2,100 ms
+  renewal RTT = 4 ms
+  TTL ≥ 3 × (max_pause + RTT) = 3 × 2.104 = 6.3 s → choose TTL 10 s
+      renewal every 3.33 s
+  A 2.1 s pause: renewals at t=0, 3.33, 6.66 all succeed despite the pause.
+  A pathological 12 s pause: lease expires at t=10, another node takes over
+      at t=10 → overlap from t=10 to t≈12 → FENCE REQUIRED. (This is §5.)
+  ⇒ the TTL is chosen for RECOVERY SPEED (a dead holder is replaced in 10 s),
+    and the fence is what makes a 12 s pause survivable. Two mechanisms,
+    two jobs — the most common design error is using the TTL for both.
+```
+
+**Step 4 — the throughput ceiling a lock imposes, which is the real argument against it.**
+
+```
+  critical_section = 40 ms  ⇒  1 / 0.040 = 25 ops/sec, regardless of workers
+  critical_section = 1.4 ms ⇒  1 / 0.0014 = 714 ops/sec   (the usual case:
+                                a small read-modify-write)
+  ⇒ If your required rate exceeds 1/critical_section, a lock is the wrong
+    design and no amount of workers helps. At BookNook's 400/s flash sale
+    against a 40 ms section, a lock caps you at 6 % of the demand — which is
+    why §7.1's atomic UPDATE (≈5,000/s) wins.
+```
+
+**Step 5 — contention cost in lock-service round trips.**
+
+```
+  400 waiters polling every 50 ms (no jitter): 400 × 20 = 8,000 polls/sec
+      × 0.4 ms = 3,200 ms/s of lock-service CPU — 3.2 cores doing nothing
+  with full jitter (uniform 0–50 ms): statistically the same rate, BUT
+      desynchronised, so the service sees a smooth 8,000/s instead of 400
+      spikes of 400 — the difference between capacity and a self-inflicted
+      DoS (L65 §8.3).
+  with a fair queue (ZooKeeper): 1 watch per waiter per grant = 400 watches
+      TOTAL, not per second, and no polling at all.
+  ⇒ Redis polling costs O(waiters × polls/sec); a queue costs O(waiters).
+```
+
+## 10. Trade-offs
+
+| Decision | Buys you | Costs you | Choose it when |
+|---|---|---|---|
+| **No lock — atomic conditional write** | 5,000/s, no lease semantics, no pause hazard | Requires the protection to live in the store | The protected resource is a database you control — **default** |
+| **`FOR UPDATE SKIP LOCKED`** | Partitioned work, no blocking, no herd | Rows held for the transaction only | Claiming units of work |
+| **Redis `SET NX PX`** | ~0.3 ms acquisitions, ubiquitous | No native fence, no fairness, single-node safety hole | Best-effort coordination where a rare overlap is tolerable |
+| **Redis + explicit `INCR` fence** | Cheap *and* safe | Must enforce the fence at the store | Coordination of an external system |
+| **ZooKeeper / etcd lease** | Native fence, fair queue, session release | ~2–5 ms per acquisition; needs a quorum | Correctness matters: schedulers, reindex, partitioning |
+| **Database lease table** | No extra service; queryable; transactional with data | Polling cost; a row is a single point of contention | Moderate frequency (≤ hundreds of grants/sec) |
+| **Optimistic concurrency** | No leases, no blocking, aborts only real conflicts | Retries under high conflict | Document edits, low-conflict updates |
+| **Long TTL** | Fewer false takeovers | Slow recovery from a dead holder | Long critical sections |
+| **Short TTL** | Fast recovery | More false takeovers and renewals | Short critical sections, and a fence |
+| **No fence** | Less code | **Silent corruption on any pause** | Never |
+
+## 11. Failure scenarios
+
+**11.1 — Two writers from a pause** (§5). A 12-second GC pause exceeded a 30-second TTL? No — the pause ended *after* the TTL, and the resuming holder kept writing. Two writers, duplicated invoices. **Symptom:** rare duplicates correlated with GC or VM migration events. **Fix:** fencing tokens enforced by the store.
+
+**11.2 — Lock without a TTL.** A worker acquired a lock, then OOM-killed; the resource was locked forever and the nightly job silently stopped running for 6 weeks. **Symptom:** a job that simply never runs, with no errors. **Fix:** every lock is a lease; alarm on "no successful run in 26 hours".
+
+**11.3 — TTL shorter than the work.** A 20-minute reindex with a 60-second TTL and no renewal: the lease expired 19 times, and each time another node took over, so *four* nodes reindexed concurrently. **Symptom:** four times the load, an index in an inconsistent state. **Fix:** renewal at TTL/3, and a TTL that reflects the work (§9 step 3).
+
+**11.4 — Deleting someone else's lock.** `GET` then `DEL` without a transaction: between the two, the lease expired and was re-granted, so the release deleted the *new* holder's lock. **Symptom:** occasional unexplained concurrent execution. **Fix:** compare-and-delete in one atomic operation (Lua / WATCH-MULTI / conditional delete).
+
+**11.5 — The lock as a transaction substitute.** Two operations that must be atomic were each guarded by the lock, but a crash between them left state half-applied, and the next holder saw inconsistent data. **Symptom:** invariant violations after crashes, not after concurrency. **Fix:** a lock is not atomicity; use a transaction, or a saga with compensations (L84).
+
+**11.6 — Redlock without a fence, across clock jumps.** A holder paused; its lease was judged expired by three of five Redis nodes; a second holder acquired; the first resumed and wrote. The quorum made the *grant* consistent; nothing made the *write* safe. **Symptom:** the same as §11.1, with more confidence that it cannot happen. **Fix:** a fence, always.
+
+**11.7 — The herd on expiry.** Two hundred workers polled the same key every 100 ms; when the lease expired, all 200 attempted acquisition in the same millisecond, and the lock service (single Redis node) spent 400 ms servicing them, delaying every other operation on that node. **Symptom:** a latency spike elsewhere correlated with lock expiry. **Fix:** full jitter, a fair queue, or partitioning.
+
+**11.8 — The lock that protected nothing.** A lock guarded a code path but the *other* writer did not take the lock (a backfill script written by another team, running "just this once"). **Symptom:** duplication that no amount of lock analysis explains. **Fix:** the fence at the store — the only place a participant cannot be forgotten.
+
+## 12. Alternatives
+
+| Instead of a lock | Consider | When |
+|---|---|---|
+| Distributed lock | **Idempotency + dedup** (L74) | The requirement is "effect once", not "one at a time" |
+| Distributed lock | **Atomic conditional UPDATE** | The resource is a row you control (§7.1) |
+| Distributed lock | **`FOR UPDATE SKIP LOCKED`** | The requirement is work assignment |
+| Distributed lock | **Optimistic concurrency (version/ETag)** | Conflicts are rare; aborting is acceptable |
+| Distributed lock | **Leader election** (L79) | The requirement is "one node is in charge" |
+| Distributed lock | **Partition ownership** (L72) | The work divides naturally by key |
+| Distributed lock | **Single-partition serialisation** | Ordering plus exclusion can share one mechanism |
+| Redis lock | **etcd/ZooKeeper lease** | You need a native fence and fairness |
+| Lock around a write | **Fence at the store** | You cannot verify every writer takes the lock |
+
+## 13. When to use it
+
+- **Only when the protected resource cannot provide exclusion itself** — an external API, a third-party service, a shared filesystem, a search index.
+- **Whenever the critical section is longer than a transaction** can reasonably hold a connection (minutes).
+- **For scheduler-style singleton work** — the nightly job, compaction, reindex — using a lease with renewal (§7.2).
+- **For coordination across teams you do not control**, where the fence must be enforced at the shared resource.
+- **With a fence, always**, whenever more than one process could conceivably hold it.
+
+## 14. When *not* to use it
+
+- **To protect a database write you already own.** The database has a lock; use it (§7.1, §12).
+- **As a substitute for idempotency.** If the real requirement is "the effect happens once", a lock is a weaker, costlier answer that fails on pauses (L74).
+- **Around long external calls** without renewal and a fence — this is the canonical double-writer bug.
+- **To serialise high-throughput operations.** A lock caps throughput at `1 / critical_section`; if that is below your requirement, the design is wrong, not the lock.
+- **When a partition already gives you the exclusion** (L72). One consumer per partition is a lock with no lease hazards.
+- **In place of a queue.** "Only one worker processes this" is usually "this should be a single-consumer queue".
+
+## 15. Common mistakes
+
+1. **No TTL**, so a crash deadlocks the resource forever (§11.2).
+2. **No fencing token**, so any pause can produce two writers (§11.1, §11.6).
+3. **A UUID used as a fence** — it has no order, so it cannot reject a stale write (§4.2).
+4. **TTL shorter than the work** with no renewal (§11.3).
+5. **Non-atomic release** (`GET` then `DEL`) (§11.4).
+6. **Renewal failure ignored**, so a worker keeps writing with a stale lease (§4.8).
+7. **Redlock believed to be safe** without a fence (§11.6).
+8. **Polling without jitter**, creating a herd (§11.7).
+9. **A lock the protected resource does not enforce**, so an unaware writer bypasses it entirely (§11.8).
+10. **Treating a lock as a transaction** — no atomicity across the section (§11.5).
+11. **Serialising a high-throughput path** and capping throughput at `1/section` (§9 step 4).
+12. **Locking per-key but with one global key**, turning a partitioned problem into a single-hotspot one.
+13. **No alarm on the lock**, so "the job stopped running" is discovered by customers.
+14. **Forgetting clock skew** (L66): a holder that trusts its own clock for expiry decisions is wrong by the skew amount.
+
+## 16. Interview perspective
+
+**What is actually being tested.** Whether you know that a distributed lock is **not a mutex** — that it is a lease, that leases can produce two holders, and that only a **fencing token** makes that safe. Strong candidates reach for the simplest mechanism that removes the need for a lock, and when they do use one they specify TTL, renewal cadence, and the fence at the store. Weak candidates draw a Redis `SETNX` box and consider the problem solved.
+
+**Answers that land well:**
+
+- *"How would you ensure only one node runs the nightly job?"* — "First I'd check whether the work can be claimed instead of locked — a `FOR UPDATE SKIP LOCKED` claim of work rows needs no lock at all and lets every node participate. If it must be one node, a lease: etcd with a 60-second TTL and keepalive every 20 seconds, and the put's revision as a fencing token that the write target enforces. The TTL decides how fast a dead node is replaced; the fence is what stops a paused node from corrupting anything."
+- *"What's wrong with a Redis lock?"* — "Nothing for best-effort coordination, but `SET NX PX` has no fencing token and no fairness, and a holder that pauses past its TTL will still act. Add an explicit `INCR`-minted fence and enforce it at the protected resource, or use etcd's revision. And never `GET`-then-`DEL` on release — that deletes someone else's lock."
+- *"Why not just lock the row?"* — "If the work fits in a transaction, do exactly that — the database's lock is atomic, has no TTL, and no pause hazard. Row locks fail only when the critical section is longer than a sane transaction, like a 20-minute reindex."
+- *"What happens if the lock service dies?"* — "With Redis single-node: all coordination stops, so I need a degrade path — skip the job rather than run it twice. With etcd: it needs a quorum, so I keep 3 or 5 nodes and accept that a minority partition cannot grant leases, which is the correct behaviour for a lock service."
+
+**Common interview tasks:** design singleton execution for a cron job; explain why a lease can produce two holders; add fencing to an existing lock design; choose between a lock and an idempotency key; size a TTL given pause data; explain Redlock's limits.
+
+**Red flags interviewers watch for:**
+
+- "Use Redis SETNX" with no TTL, no token, no fence.
+- No awareness that a lease can expire while the holder is still working.
+- Using a lock to prevent duplicate side effects instead of idempotency.
+- `GET`-then-`DEL` release.
+- No renewal, or a TTL shorter than the work.
+- "Redlock solves it" with no mention of fencing.
+- Locking a path that could simply be claimed or conditionally updated.
+- No numbers: no TTL, no critical-section duration, no throughput ceiling.
+
+## 17. Knowledge check
+
+**Conceptual**
+
+1. Explain why a distributed lock must be a lease, and why a lease alone does not guarantee mutual exclusion. Then explain precisely what a fencing token adds, where it must be enforced, and why a UUID cannot serve as one.
+2. A colleague's design is: acquire a Redis lock with `SET NX PX 30000`, do the work, then `DEL`. Enumerate the failures this design permits, and state the minimum set of changes that would make it safe for a 20-minute job against an external search index.
+3. Explain why "use a lock" is often the wrong answer to "ensure this happens exactly once", and describe three alternatives with the property each gives up. Relate your answer to the throughput ceiling `1 / critical_section`.
+
+**Practical scenario**
+
+4. BookNook must run a nightly process that: reads 240,000 pending invoices, calls a payment provider to charge each customer (150 ms each, provider limit 500/min), sends an invoice email, and writes the result to an external accounting system with no transactional API. Four worker nodes are available. Design the complete coordination: whether a distributed lock is needed at all and for which part, the claim mechanism with SQL, the lease TTL and renewal cadence given measured GC pauses of p99 400 ms and max 2.5 s, the fencing token and exactly where it is enforced, what happens when a worker pauses for 30 seconds mid-run, the throughput arithmetic against the provider's limit, the alarms, and the recovery procedure for a partially-charged customer.
+
+**Calculation**
+
+5. A flash sale has 800 units and 20,000 requests in 120 seconds. (a) Compute the peak request rate if 60 % arrive in the first 30 seconds. (b) Compute the throughput ceiling of a lock whose critical section is 25 ms, and state whether it can serve the peak. (c) Compute the number of oversold units under read-modify-write if 40 requests read the value `1` concurrently. (d) Recommend a design and compute its throughput, given that a single-row conditional `UPDATE` sustains 4,000/s and sharding into 8 counter rows multiplies that by 8.
+
+6. A lease has a TTL of 8 seconds with renewal every 2.7 seconds, and the lock service is an etcd cluster with a 5 ms round trip. (a) Compute how often a healthy holder renews and how many renewals fit in the TTL. (b) Given a 9-second stop-the-world pause, compute when the lease expires, when the next holder could acquire, and how long the overlap lasts if the paused holder resumes immediately after the pause. (c) State what the fencing token does during that overlap and what the failed holder's writes cost. (d) Recompute (b) with a TTL of 30 seconds, and explain the trade-off you made in exchange.
+
+**Progress checklist**
+
+- Phase 1 — Foundations (L1–17): **complete** ✅
+- Phase 2 — Scaling (L18–39): **complete** ✅
+- Phase 3 — Data and Storage (L40–63): **complete** ✅
+- Phase 4 — Distributed Systems (L64–92):
+  - [x] 1. Why distributed systems are difficult (L64)
+  - [x] 2. Partial failures and network partitions (L65)
+  - [x] 3. Clock differences and ordering events (L66)
+  - [x] 4. Synchronous versus asynchronous workflows (L67)
+  - [x] 5. Message queues (L68)
+  - [x] 6. Publish-subscribe systems (L69)
+  - [x] 7. Event streams (L70)
+  - [x] 8. RabbitMQ-style queues versus Kafka-style logs (L71)
+  - [x] 9. Consumer groups, partitions, offsets and ordering (L72)
+  - [x] 10. At-most-once, at-least-once and exactly-once (L73)
+  - [x] 11. Idempotent consumers and deduplication (L74)
+  - [x] 12. Dead-letter queues and retry queues (L75)
+  - [x] 13. Backpressure and load shedding (L76)
+  - [x] 14. Circuit breakers, bulkheads and graceful degradation (L77)
+  - [x] **15. Distributed locks and leases (L78) ← you are here**
+  - [ ] 16. Leader election (L79)
+  - [ ] 17. Quorums (L80)
+  - [ ] 18. Consensus and Raft (L81)
+  - [ ] 19. Distributed transactions (L82)
+  - [ ] 20. Two-phase commit (L83)
+  - [ ] 21. Saga pattern (L84)
+  - [ ] 22. Transactional outbox and change data capture (L85)
+  - [ ] 23. Monoliths, modular monoliths, microservices (L86)
+  - [ ] 24. Service discovery and configuration (L87)
+  - [ ] 25. Observability: logs, metrics, traces (L88)
+  - [ ] 26. SLIs, SLOs and error budgets (L89)
+  - [ ] 27. High availability and disaster recovery (L90)
+  - [ ] 28. Active-passive versus active-active (L91)
+  - [ ] 29. RTO and RPO (L92)
+
+**NEXT LESSON: Phase 4, Topic 16 — Leader election**
+
+---
+
+---
+
+# Lesson 79 — Leader Election
+
+*Phase 4, Topic 16*
+
+## 1. Simple definition
+
+**Leader election** is the process by which a group of processes agrees on **one of them** to hold a special role for a period of time — the *term* or *epoch* — and agrees on when that role changes hands.
+
+It is the same primitive as the lease in Lesson 78, used differently: a lock protects one short critical section; a leadership **role** persists for as long as the holder stays healthy, and every other node takes a defined standby posture while it does. The role usually means one of three things:
+
+- **Single writer**: this node is the primary database, the partition owner, or the only one that may commit a particular class of write.
+- **Coordinator**: this node assigns work — which consumer owns which partition, which worker gets which shard (L72 §6).
+- **Singleton task**: this node runs the nightly job, the compaction, the reindex (§7.2 of L78).
+
+Terms defined before use:
+
+- **Term / epoch**: a monotonically increasing number identifying a leadership period. Every message a leader sends carries its term, so everyone can tell which is newer (L66 §4).
+- **Split-brain**: two nodes both believing they are leader — the failure that leader election exists to prevent, and the one it cannot prevent alone.
+- **Quorum**: a majority of nodes (2 of 3, 3 of 5). A leader that cannot reach one usually must step down.
+- **Fencing token**: the term itself, enforced by the resource being written (§4.4) — the same mechanism as L78 §4.5.
+- **Failover**: the transition, including *detection*, *election*, and *warm-up*.
+- **Leadership churn (flapping)**: rapid repeated changes of leader, which is usually worse than a longer outage.
+
+The one sentence to carry out of this lesson: **election decides *who*; the term decides *which one is newer*; and only the resource being written can prevent the old leader from mattering — so elect with a term, and fence with it.**
+
+## 2. Why it exists
+
+Because some work must be done by **exactly one** participant, and "exactly one" is the hardest thing to arrange across machines.
+
+BookNook has three cases, all of which hurt when they go wrong:
+
+| Need | What happens with no election | Cost |
+|---|---|---|
+| **One cron scheduler** | 3 nodes run every job (§7.1 of L78) | 250,000 duplicate invoices/night |
+| **One partition assignor** (L72 §6) | Two coordinators assign different partitions to the same consumer | Duplicate processing, lost offsets |
+| **One primary database** | Two primaries accept writes | Divergent data, and a merge nobody can perform |
+| **One cache-warmer** | Every node rebuilds the same 40,000-entry cache | 8× wasted work and a thundering herd |
+
+The interesting failure is not "nobody is leader" — that is an outage, and outages are visible. The interesting failure is **two leaders**, because both are *serving traffic*, both *look healthy*, and the damage is **silent divergence** that appears days later.
+
+BookNook's 2024 near-miss: a Postgres primary lost its network for 40 seconds. The failover promoted a replica. The old primary, still running with a now-stale view of the world, kept accepting writes from a subset of app servers — **1,400 orders** written to a database that would be discarded when it re-synced. Two leaders, no error, and the only detector was a reconciliation report three days later.
+
+That is why this lesson is mostly about the *unpleasant* half of election:
+
+- **Safety** — at most one leader per term — is achievable and must be proven by quorum.
+- **Liveness** — a new leader eventually appears — costs availability, by design.
+- **Protection** — the stale leader cannot corrupt anything — is only achievable with fencing or quorum-enforced writes (§4.4).
+
+And the constraint that makes it hard: **you cannot distinguish a dead node from a slow or partitioned one** (L65 §3). Election handles this by *not trying*: it assumes the worst, waits out a timeout, and relies on terms to resolve the ambiguity afterwards.
+
+## 3. Real-world analogy
+
+**A building site with one foreman.**
+
+The crew of 40 cannot all hold the plan. So one is foreman: he assigns tasks, signs off work, and is the only person the site office will accept instructions from. Every property of leader election is in the arrangement:
+
+**The foreman carries a numbered badge.** Badge **#7** means "the seventh foreman this project has had". When the site office receives an instruction, it records the badge number and **refuses anything lower**. This is the **term**, and it is why a dispute between two foremen resolves without argument: whoever has the higher number is the foreman, regardless of who is shouting louder.
+
+**The foreman must check in every morning.** If he does not appear by 8 a.m., the crew elects a new foreman with badge **#8**. The 8 a.m. deadline is the **lease TTL**; the check-in is the **renewal**. Without a deadline, a foreman who is ill or on holiday blocks the site forever (the crash-without-TTL deadlock).
+
+**The foreman from yesterday might still be on site.** Suppose the old foreman (#7) had a phone problem, missed the check-in, and the crew elected #8 — and then #7 walks back in an hour later, still believing he is in charge, and tells a subcontractor to pour concrete. Two foremen giving instructions is the **split-brain**, and the fix is not to argue: it is that the **site office refuses instructions with badge #7**. That is the **fence**, and it lives at the office — where the concrete is actually recorded — not in anyone's head.
+
+**The handover costs time.** The crew does not work at full speed while the foreman is missing. Detection (waiting until 8:15 to be sure), election (a show of hands), and briefing (the new foreman reads the plan) are all **unavailability**. Every production system pays this; the only question is how much. That is the **failover budget** (§4.5).
+
+The final property, and the one most often neglected: **you want the foreman to keep the job, not to rotate.** A crew that re-elects a foreman every hour because the badge number is momentarily unclear gets nothing built. **Stable leadership is worth waiting for**, which is why real systems use randomised timeouts, long leases, and «prefer the incumbent» rules rather than electing on the first hint of trouble.
+
+## 4. Detailed technical explanation
+
+### 4.1 The four properties, and who provides each
+
+| Property | Statement | Mechanism |
+|---|---|---|
+| **Safety (agreement)** | At most one leader per term | Quorum vote, or a linearizable lock service |
+| **Liveness** | If the leader fails, a new one appears | Timeouts, randomised, bounded |
+| **Non-divergence** | The old leader cannot corrupt state | **Fencing tokens** or quorum-enforced writes (§4.4) |
+| **Stability** | Leadership does not flap | Long leases, randomised timers, incumbent preference |
+
+No single mechanism gives all four. Quorum gives (1); timers give (2); **the fence gives (3)**; tuning gives (4). Most designs implement (1) and (2) and assume (3) follows — it does not, and that assumption is the bug in §2's near-miss.
+
+### 4.2 Terms, and why a boolean is not enough
+
+A node that says "I am leader" is useless, because two nodes can both say it. A node that says "I am leader **for term 7**" is resolvable:
+
+```
+  Node A: "I am leader, term 7"     ─┐
+  Node B: "I am leader, term 8"     ─┴─► term 8 wins, unconditionally.
+                                        A is stale even if it is healthy,
+                                        even if it has more data, even if
+                                        a human prefers it.
+```
+
+This is the same reasoning as L66 (ordering events needs a total order, not wall-clock time) and L72 (partition generation numbers). **A term is a logical clock for leadership**, and it is what makes the whole thing decidable.
+
+### 4.3 The mechanisms, from cheapest to strongest
+
+| Mechanism | How | Failover time | Safety under partition | Notes |
+|---|---|---|---|---|
+| **DB lease row** | `UPDATE ... WHERE locked_until < now()` (§4.3 of L78) | TTL + poll | Depends on a single DB | Simplest; fine for a cron job |
+| **Redis `SET NX PX`** | As L78 | TTL | Weak (single node, no fence) | Best-effort only |
+| **etcd / ZooKeeper** | Lease + ephemeral node + revision fence | TTL (~5–15 s) | Requires quorum | The pragmatic standard |
+| **Kubernetes `Lease` object** | Built on etcd, with `holderIdentity`, `renewTime`, `leaseDurationSeconds` | ~15 s default | Requires API server | The default inside Kubernetes |
+| **Raft election** | Randomised election timeout, candidate requests votes, majority wins, term increments | ~150–500 ms | **Strong** (quorum, and a leader without quorum cannot commit) | What etcd/Consul/CockroachDB actually do |
+| **External arbiter** | A witness service, or a shared storage with atomic rename | Varies | As good as the arbiter | Used in older HA pairs (STONITH, quorum disks) |
+
+The important split is between **lease-based** (etcd client lease, K8s Lease, DB row) and **consensus-based** (Raft). A lease-based election is *built on* a consensus system and adds a client-side timer; it is simpler and slower to fail over. Raft elections are faster and safer — because the leader cannot commit without a majority, which is a structural fence rather than a cooperative one.
+
+### 4.4 Split-brain, and the three ways to survive it
+
+```
+  ── the classic split-brain ────────────────────────────────────────────────
+       ┌─────────────┐            ┌─────────────┐
+       │  node A     │   X X X    │  node B     │
+       │ "I'm leader"│  (network) │ "I'm leader"│
+       └──────┬──────┘            └──────┬──────┘
+              │ writes                   │ writes
+              ▼                          ▼
+       ┌──────────────────────────────────────────┐
+       │  shared resource: two divergent writes   │
+       └──────────────────────────────────────────┘
+
+  ── fix 1: QUORUM-ENFORCED WRITES (structural) ────────────────────────────
+       the leader may only commit after a majority acknowledges.
+       A partition minority can "believe" it is leader and commit NOTHING.
+       ⇒ divergence is impossible, not merely unlikely. (Raft, L81.)
+
+  ── fix 2: FENCING TOKENS (cooperative, works with any resource) ──────────
+       every write carries the term; the resource rejects term < max_seen.
+       ⇒ the stale leader's writes fail loudly instead of landing silently.
+
+  ── fix 3: STONITH / isolation (physical) ─────────────────────────────────
+       before promoting, ensure the old leader cannot run: power it off
+       ("shoot the other node in the head"), revoke its credentials, or
+       fence it at the network layer (STONITH is a real technique, not a
+       joke, and it is why some systems do not use leases at all).
+```
+
+Only (1) and (2) are usable in software you write. Use **(1) if you are building the store**; use **(2) if the store is external** — a third-party API, a search index, a shared filesystem.
+
+### 4.5 The failover budget: where the unavailability goes
+
+Every leader-based system has a **failover budget**, and it is the sum of three parts:
+
+```
+  ── PART 1: DETECTION ────────────────────────────────────────────────────
+     how long before anyone is sure the leader is gone.
+     lease TTL (e.g. 15 s); expected detection with renewal at TTL/3 is
+     roughly TTL − last_renewal ≈ 10–15 s.
+
+  ── PART 2: ELECTION ──────────────────────────────────────────────────────
+     how long to agree on the successor: one consensus round (~150–500 ms in
+     Raft), or a poll cycle on a lease (up to the TTL again).
+
+  ── PART 3: WARM-UP ───────────────────────────────────────────────────────
+     how long the new leader needs before it is useful: load the plan,
+     replay the log, rebuild in-memory state, connect pools.
+     This is usually the LARGEST part and the most neglected:
+     10 ms to elect, 4 minutes to warm a search index.
+
+  ⇒ failover budget = detection + election + warm-up
+                    = 15 s + 0.3 s + 90 s ≈ 105 s for BookNook's assignor
+```
+
+The design consequence: **shortening the TTL is not the main lever.** If warm-up dominates, the fix is a *warm standby* (keep a follower continuously up to date so promotion is instant), not a more aggressive timeout — and aggressive timeouts buy flapping (§4.7).
+
+### 4.6 What the standbys do
+
+| Standby mode | Ready in | Cost | Use |
+|---|---|---|---|
+| **Hot** (replicated, live) | milliseconds–seconds | Full duplication of work | Databases, Raft followers |
+| **Warm** (state kept fresh, not serving) | seconds–minutes | Replication bandwidth only | Search index, cache-warmed workers |
+| **Cold** (start from scratch) | minutes–hours | Almost free | Batch jobs that can restart |
+
+The choice determines the failover budget's third term, and it is where most of the engineering effort actually goes. BookNook's consumer coordinator kept a **warm** standby: it replayed the group metadata every second so that promotion took 700 ms rather than the 90 seconds it took to rebuild the assignment from scratch.
+
+### 4.7 Churn, or why electing fast is usually a bug
+
+Leadership churn happens when the lease is shorter than the jitter in the system:
+
+```
+  lease TTL 3 s, network p99.9 1.2 s, GC pauses up to 2.5 s
+  ⇒ renewals regularly miss → leadership changes every few seconds
+  ⇒ each change costs detection + warm-up (~90 s for a search index)
+  ⇒ the system is never healthy for long enough to do anything.
+```
+
+Controls, in order of effectiveness:
+
+1. **Lease TTL ≥ 3 × (worst pause + RTT)** — the L78 §4.6 rule, applied to roles.
+2. **Randomised election timers** (Raft's 150–300 ms randomisation) so competing candidates do not tie repeatedly.
+3. **Incumbent preference**: a healthy leader renews without contest; challengers back off exponentially.
+4. **Do not elect on transient signals** — not on a CPU spike, a slow query, or a single failed health check.
+
+### 4.8 Leadership is not a mutex
+
+Worth stating explicitly, because conflating them causes bad designs:
+
+| | Distributed lock (L78) | Leader election (L79) |
+|---|---|---|
+| Duration | Milliseconds–seconds | Minutes–hours |
+| Contention | Many attempt, one at a time, repeatedly | One holds; others stand by |
+| On failure | Another attempt acquires it | A **role change**, with state transfer |
+| Costs | Acquisition latency | **Failover budget** (detection + election + warm-up) |
+| Enforced by | Compare-and-delete + fence | Term + fence, or quorum |
+
+A system that runs an election per request has built a lock with an enormous, badly-tuned failover path.
+
+## 5. Request / data flow
+
+A three-node coordinator cluster (`n1`, `n2`, `n3`) using etcd leases, with a leader failure.
+
+```
+ ── STEADY STATE ───────────────────────────────────────────────────────────
+  n1  leader (term 7, lease TTL 15 s, renewal every 5 s)
+  n2  standby, warm: replays group metadata every 1 s
+  n3  standby, warm
+  n1 assigns partitions; every assignment message carries term=7.
+
+ ── FAILURE ───────────────────────────────────────────────────────────────
+ t=00:00  n1 loses its network link (process alive, isolated)
+ t=00:00  n1's renewal fails; it does NOT immediately stop serving —
+          it has until the lease expires (t=00:15) before anyone else may act.
+ t=00:05  renewal fails again on n1 (3 consecutive)
+ t=00:09  n1's last successful renewal expires at t=00:15 → n1 self-demotes
+          at t=00:10 (a well-built client stops as soon as it cannot renew,
+          rather than waiting for expiry — this shrinks the overlap window).
+ t=00:15  etcd expires the lease; n2 and n3 both attempt to acquire
+ t=00:15  n2 wins the CAS → term 8, fence = etcd revision 4,182,911
+ t=00:15  n2 promotes: it already has the metadata (1 s replay) → 700 ms warm-up
+ t=00:16  n2 publishes assignments with term=8
+ t=00:16  n3 sees term 8 and stands by (its attempt failed; it backs off
+          exponentially with jitter so it does not fight n2)
+ ⇒ unavailability: ~16 s for coordinator duties (detection 15 s + 0.7 s warm).
+
+ ── THE ISOLATED OLD LEADER ────────────────────────────────────────────────
+ t=00:16  n1 regains its network link and still believes term 7 briefly.
+          Its assignment messages carry term=7.
+          Consumers compare terms and REJECT term 7 < 8. ✓
+          Its writes to the assignment table carry fence 4,182,911 and are
+          rejected against max_seen 4,182,950. ✓
+ ⇒ split-brain of ~1 s, harmless.
+
+ ── WITHOUT A FENCE OR TERM ────────────────────────────────────────────────
+ t=00:16  n1 assigns partition p3 to consumer C, n2 assigns p3 to consumer D.
+          Both consumers process p3: duplicate events, and offset commits
+          from one overwrite the other → silent data loss (L72 §11.2).
+```
+
+The critical design choice in that timeline: **n1 stops serving before its lease expires** (at t=00:10, not t=00:15). That is a *cooperative* safety improvement — it shortens the overlap from 5 s to 0 — but it cannot be relied upon, because a paused process cannot stop itself. **Terms are what you rely on.**
+
+## 6. ASCII diagram
+
+The election, as a sequence with the three timing components marked:
+
+```
+  n1 (leader)      n2 (standby)        n3 (standby)        etcd (quorum)
+      │                 │                   │                  │
+      │ renew 5 s ──────┼───────────────────┼─────────────────►│ ✓
+      │ renew 5 s ──────┼───────────────────┼─────────────────►│ ✓
+   ✗ crash              │                   │                  │
+      │                 │                   │        lease expires (15 s)
+      │                 │                   │                  │
+      │                 │  campaign ────────┼─────────────────►│
+      │                 │                   │  campaign ──────►│
+      │                 │◄──── granted, term 8 (CAS wins) ─────┤
+      │                 │                   │◄── term 9? denied ┤
+      │                 │  publish(term=8)  │                  │
+      │                 │                   │  stand by (term 8)│
+      │                 │                   │                  │
+      └── DETECTION (15 s) ── ELECTION (0.2 s) ── WARM-UP (0.7 s) ──►
+```
+
+The split-brain, with the fence doing the work:
+
+```
+       old leader (term 7)                 new leader (term 8)
+              │                                    │
+       write(term=7, fence=4182911)         write(term=8, fence=4182950)
+              │                                    │
+              ▼                                    ▼
+     ┌──────────────────────────────────────────────────────┐
+     │  shared resource:  max_fence = 4182950               │
+     │                                                    │
+     │  fence 4182911 < 4182950  →  REJECTED  ✗           │
+     │  fence 4182950 ≥ 4182950  →  ACCEPTED  ✓           │
+     └──────────────────────────────────────────────────────┘
+       ⇒ the stale leader is not "convinced"; it is INEFFECTIVE.
+```
+
+## 7. Detailed example
+
+### 7.1 BookNook's partition assignor
+
+Kafka's consumer-group coordination (L72 §6) requires one broker to be the **group coordinator** and one consumer to be the **assignor**. BookNook runs this itself for its own work-queue system over Postgres, because it wanted control over the assignment policy.
+
+```
+  Design:
+    coordination: Postgres row `coordinator_lease` (no extra service)
+    TTL: 15 s, renewal every 5 s
+    fence: a monotonic `token` column, incremented on every grant
+    standbys: replay the assignment table every 1 s (warm standby)
+    assignment writes: INSERT ... WHERE token >= (SELECT token FROM ...)
+    every assignment row carries `term`
+
+  Measured failover:
+    detection  ~15 s  (lease expiry; the holder self-demotes at ~10 s)
+    election   ~40 ms (one UPDATE ... WHERE locked_until < now())
+    warm-up    ~700 ms (the standby's 1 s replay means it is nearly current)
+    ────────────────────────────────────────────
+    total      ~16 s of coordinator unavailability
+    impact     consumer assignment is frozen for 16 s; existing consumers
+               KEEP processing their current partitions throughout (L72 §6:
+               a dead coordinator does not stop work, only rebalancing).
+  ⇒ the 16 s cost almost nothing, which is why nobody tried to shorten it.
+```
+
+The lesson in that table: **the expensive part of designing leader election is not the election; it is deciding what stops while there is no leader.** BookNook measured it and found the answer was "almost nothing", which meant a simple, slow, safe lease was the right design.
+
+### 7.2 The failover that produced two primaries
+
+BookNook's Postgres HA used a lease-based cluster manager with a 10-second TTL. During a storage hiccup, `primary-1`'s disk stalled for **14 seconds** — a liveness failure from the cluster manager's point of view. It promoted `replica-2`. `primary-1` then recovered, and its Postgres process — which had not been stopped — applied its queued WAL and continued accepting writes from the connection pool, which had not yet been reconfigured.
+
+```
+  window of two primaries: 38 s
+  writes accepted by primary-1: 1,400 orders, 3,900 sessions, 812 payments
+  outcome: primary-1 was discarded during re-sync ⇒ 1,400 orders lost,
+           812 payments charged with no matching order.
+```
+
+The three fixes, all of them structural rather than "faster detection":
+
+1. **Fencing at the storage layer** — the cluster manager's promotion incremented a term, and the block device (or a proxy in front of it) rejected writes carrying an older term. This is how real HA systems do it.
+2. **STONITH** — before promoting, power off the suspected-dead primary (via a management API), so recovery cannot happen. Brutal, effective, and standard.
+3. **Clients check the term** — the connection pool re-resolved the primary and refused to write to a node whose reported term was stale.
+
+The general rule: **a lease can tell you the leader is probably dead. It cannot make a slow-but-alive leader stop writing.** Only fencing, quorum, or STONITH can, and a design without one of those three is relying on luck.
+
+## 8. Code or configuration example
+
+```python
+# ============================================================================
+# BookNook: leader election on a database lease, with a term as the fence.
+# ============================================================================
+
+class Election:
+    def __init__(self, db, name, node_id, ttl_s=15, renew_every_s=5):
+        self.db, self.name, self.node = db, name, node_id
+        self.ttl, self.renew_every = ttl_s, renew_every_s
+        self.term = None
+
+    def campaign(self) -> bool:
+        """One atomic claim. Returns True if we now hold the role."""
+        row = self.db.fetch_one("""
+            UPDATE coordinator_lease
+               SET holder = %s,
+                   term   = term + 1,                      -- THE FENCE
+                   locked_until = now() + (%s || ' seconds')::interval
+             WHERE name = %s
+               AND (locked_until IS NULL OR locked_until < now())
+         RETURNING term
+        """, (self.node, self.ttl, self.name))
+        if row:
+            self.term = row["term"]
+            log.info("became leader", extra={"term": self.term})
+            metrics.set("leader", 1)
+            return True
+        return False
+
+    def renew(self) -> bool:
+        """Only the holder can renew, and only while the lease is still valid."""
+        row = self.db.fetch_one("""
+            UPDATE coordinator_lease
+               SET locked_until = now() + (%s || ' seconds')::interval
+             WHERE name = %s AND holder = %s AND term = %s
+               AND locked_until > now()
+         RETURNING term
+        """, (self.ttl, self.name, self.node, self.term))
+        if not row:
+            # LEASE LOST. Self-demote IMMEDIATELY — do not wait for expiry,
+            # and do not finish in-flight work (§5, t=00:10).
+            self.demote("renew_failed")
+            return False
+        return True
+
+    def demote(self, reason):
+        log.error("stepping down", extra={"term": self.term, "why": reason})
+        metrics.set("leader", 0)
+        metrics.incr("leader.demoted", tags={"reason": reason})
+        self.term = None
+
+    def run(self, on_lead, on_standby):
+        while True:
+            if self.term is None:
+                if self.campaign():
+                    on_lead(self.term)
+                else:
+                    on_standby()                 # keep the standby WARM (§4.6)
+                    time.sleep(random.uniform(1, 3))   # jitter: no herd (§4.7)
+            else:
+                time.sleep(self.renew_every)
+                self.renew()
+
+
+# --- The protected resource enforces the term (the only real guarantee) ----
+def publish_assignment(term: int, partition: int, consumer: str):
+    db.execute("""
+        INSERT INTO assignments (partition, consumer, term)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (partition) DO UPDATE
+           SET consumer = EXCLUDED.consumer, term = EXCLUDED.term
+         WHERE assignments.term <= EXCLUDED.term     -- STALE TERMS REJECTED
+    """, (partition, consumer, term))
+    # 0 rows affected ⇒ we are a stale leader. Stop, log loudly, alert.
+```
+
+```yaml
+# --- Kubernetes: the built-in Lease object (what controller-runtime uses) --
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: booknook-reindex-leader
+spec:
+  holderIdentity: reindex-worker-3
+  leaseDurationSeconds: 15          # others may take over after 15 s
+  renewTime: "2026-10-30T09:14:02.000000Z"
+  acquireTime: "2026-10-30T08:02:11.000000Z"
+  leaseTransitions: 4               # increments per handover: THE TERM
+```
+
+```go
+// --- client-go leader election, the standard library call ------------------
+lock, _ := resourcelock.NewFromKubeconfig(
+    resourcelock.LeasesResourceLock, "booknook", "reindex-leader",
+    resourcelock.ResourceLockConfig{Identity: nodeID}, cfg, 10*time.Second)
+leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+    Lock:            lock,
+    LeaseDuration:   15 * time.Second,   // detection window
+    RenewDeadline:   10 * time.Second,   // must be < LeaseDuration
+    RetryPeriod:     3 * time.Second,    // jittered internally
+    ReleaseOnCancel: true,               // DEMOTE FAST on shutdown
+    Callbacks: leaderelection.LeaderCallbacks{
+        OnStartedLeading: runAsLeader,   // gets ctx cancelled on loss
+        OnStoppedLeading: func() { log.Fatal("leadership lost") },
+    },
+})
+```
+
+## 9. Numerical example
+
+BookNook's coordinator: 3 nodes, 12 partitions, 3,000 events/sec across the group.
+
+**Step 1 — the failover budget, and which term dominates.**
+
+```
+  detection   lease TTL 15 s, renew every 5 s
+              a crash 0.1 s after a renewal ⇒ 14.9 s before expiry
+              a crash 4.9 s after ⇒ 10.1 s
+              expected ≈ 12.5 s (uniform)
+  election    40 ms (one conditional UPDATE)
+  warm-up     700 ms (warm standby replaying every 1 s)
+  ─────────────────────────────────────────────────────
+  total       ≈ 13.2 s, of which DETECTION is 95 %.
+
+  ⇒ Levers ranked by value:
+     1. shorten the TTL        → but flapping risk (§4.7), and it is bounded
+                                 below by 3 × worst pause
+     2. warm the standby better→ already 700 ms; little left
+     3. make the role optional → the real lesson (§9 step 2)
+```
+
+**Step 2 — what actually stops during failover.**
+
+```
+  L72 §6: a dead coordinator stops REBALANCING, not PROCESSING.
+  during the 13.2 s: existing consumers keep their partitions and keep
+      consuming. Only new/leaving members wait.
+  throughput impact: 0 events/sec lost (steady state, no membership change)
+  if a member happened to join during that window: 13.2 s of extra delay
+      for that member, which is invisible at human scale.
+  ⇒ the true cost of failover was ~13 s of rebalancing latency, not 13 s of
+    outage — which is why the team stopped optimising the TTL.
+```
+
+**Step 3 — why the TTL cannot simply be 3 s.**
+
+```
+  measured GC pause max 2.5 s, network RTT p99.9 40 ms
+  required TTL ≥ 3 × (2.5 + 0.04) = 7.6 s → 15 s gives 2× margin.
+  At TTL 3 s: a 2.5 s pause consumes 83 % of the lease → renewals miss →
+      leadership churn. Simulated: 14 leadership changes in 10 minutes,
+      each costing 0.7 s warm-up + 3 s of assignment-publish backoff
+      ⇒ ~52 s of degraded assignment per 10 minutes = 8.7 %.
+  ⇒ a short TTL does not reduce the outage; it CREATES one.
+```
+
+**Step 4 — the cost of split-brain, which sets the safety budget.**
+
+```
+  two primaries for 38 s (§7.2), at BookNook's 10 orders/sec peak:
+      duplicate-risk orders: 38 × 10 = 380 (measured: 1,400 over a longer
+      window with pooled retries)
+      of those, 812 payments were charged on the discarded primary
+      manual repair: 1 engineer × 2.5 days = ~£2,000 labour
+      customer-visible: 1,400 orders lost, goodwill credits ~£9,800
+  ⇒ the safety budget for leader election is measured in REVENUE, and it
+    dwarfs the availability budget. Spend on fencing, not on faster leases.
+```
+
+**Step 5 — quorum arithmetic, which decides how many nodes you need.**
+
+```
+  cluster size N, quorum = ⌊N/2⌋ + 1
+      N=3 → quorum 2 → tolerates 1 failure → 99.9 % per node ⇒ cluster
+            availability per write ≈ 99.9999 % (needs any 2 of 3)
+      N=5 → quorum 3 → tolerates 2 failures
+      N=2 → quorum 2 → tolerates 0 failures  ← worse than one node, and the
+            classic mistake: 2-node clusters have no failure tolerance at all
+      N=4 → quorum 3 → tolerates 1 failure but costs more than N=3
+  ⇒ use ODD sizes: 3 for most things, 5 for cross-AZ.
+  ⇒ never use 2 for anything that elects.
+```
+
+## 10. Trade-offs
+
+| Decision | Buys you | Costs you | Choose it when |
+|---|---|---|---|
+| **No leader (all nodes active)** | No failover budget | Needs idempotency/partitioning to avoid duplicates | The work partitions cleanly (L72) — often the best answer |
+| **DB lease election** | No new service; queryable | Single DB dependency; polling | Moderate needs; the job can wait 15 s |
+| **etcd / ZooKeeper** | Native fence (revision), fair queue | Extra cluster, quorum operations | Coordination is core to the system |
+| **Kubernetes Lease** | Zero extra infrastructure in K8s | API-server dependency; ~15 s | Controllers, cron-like work |
+| **Raft election** | Fast (~200 ms), quorum-safe | Complexity; needs implementing or adopting | You are building the store itself (L81) |
+| **Short TTL** | Fast failover | **Churn** under real pauses (§9 step 3) | Only with measured pause data |
+| **Long TTL** | Stability | Slow failover | The role is not latency-critical |
+| **Warm standby** | Seconds-to-promote | Continuous replication cost | Any role where failover matters |
+| **Cold standby** | Cheap | Minutes-to-promote | Batch work that can restart |
+| **Fencing at the resource** | The only real split-brain protection | Every writer must carry the term | Always |
+| **No fencing, "trust the lease"** | Less code | Silent divergence on a pause (§7.2) | Never |
+
+## 11. Failure scenarios
+
+**11.1 — Two primaries after a slow-but-alive stall** (§7.2). A 14-second disk stall looked like death; promotion happened; the old primary recovered and accepted writes. **Symptom:** divergent data discovered days later by reconciliation. **Fix:** fencing at the storage layer, STONITH, or quorum-enforced writes.
+
+**11.2 — Leadership flapping.** A 3-second lease with 2.5-second pauses produced 14 leadership changes in 10 minutes; each cost a warm-up, so the role was never usefully held. **Symptom:** leadership-transition counter climbing; work stalling. **Fix:** TTL ≥ 3 × worst pause, randomised backoff for challengers, incumbent preference.
+
+**11.3 — The cron that stopped running.** A lease-based scheduler's renewal began failing silently (an expired credential), so no node ever became leader and the nightly job stopped for three weeks. **Symptom:** "no successful run" — which nobody alarmed on. **Fix:** alarm on **the job's outcome**, not on leadership state: "no successful invoice run in 26 hours" is the alarm that matters.
+
+**11.4 — Every node campaigning in a tight loop.** A misconfigured retry (no sleep, no jitter) meant 8 nodes hammered the election table at 2,000 attempts/sec, saturating the database and delaying the very writes the leader needed. **Symptom:** DB CPU spikes correlated with coordinator instability. **Fix:** jittered backoff, and a cap on campaign attempts per minute.
+
+**11.5 — Stale leader does read-modify-write.** Fencing protected writes, but the stale leader's *reads* were cached and used to compute values it then wrote with a valid current term after re-acquiring leadership. **Symptom:** a value that regresses, no fencing violation logged. **Fix:** on promotion, discard all cached state (a "new term, new state" rule) — an old leader's memory is not data.
+
+**11.6 — The two-node cluster.** A 2-node etcd cluster: losing either node removed quorum, so the cluster could not elect anything and the system was *less* available than a single node (99.9 % → ~99.8 % *and* no failover). **Symptom:** total coordination outage on any single failure. **Fix:** odd-sized clusters, 3 or 5.
+
+**11.7 — Leader election used per request.** A team implemented "elect a leader per order" with a 15-second lease to avoid double-processing; throughput collapsed to 66 orders/sec (1/15 s) and p99 was dominated by lease waits. **Symptom:** throughput cliffs at a round number. **Fix:** that is an idempotency problem (L74) or an atomic-UPDATE problem (L78 §7.1), not an election problem.
+
+**11.8 — Standby that was not warm.** A cold standby needed 4 minutes to load its index, so every failover meant 4 minutes of unavailability — 16× the detection time the team had spent weeks optimising. **Symptom:** failovers always take "about 4 minutes" regardless of lease tuning. **Fix:** instrument the three phases separately (§4.5) and optimise the largest.
+
+## 12. Alternatives
+
+| Instead of electing a leader | Consider | When |
+|---|---|---|
+| Leader election | **Partitioned ownership** (L72) | Every node can own a disjoint share; no role needed |
+| Leader election | **Idempotency + all-active** (L74) | Duplicate execution is harmless if effects are deduplicated |
+| Leader election | **Atomic conditional writes** (L78 §7.1) | The contention is on a single row, not a role |
+| Leader election | **A queue with one consumer** | Serialisation is the requirement, not a role |
+| Leader election | **Deterministic assignment** (hash the work) | Any node can compute who should do what |
+| Lease election | **Consensus election** (Raft, L81) | You need sub-second failover and structural safety |
+
+## 13. When to use it
+
+- **Singleton scheduled work** — nightly jobs, compaction, reindex, cache warming.
+- **Coordination roles** — partition assignment (L72 §6), shard ownership, work distribution.
+- **Single-writer requirements** — the primary of a replicated store, a serialisation point for a namespace.
+- **Background reconcilers** — one controller per resource type, so reconcilers do not fight.
+- **Whenever a long-lived role, not a short critical section, is what you need.**
+
+## 14. When *not* to use it
+
+- **When the work partitions cleanly.** Assign by hash or by queue claim and skip the entire failover budget.
+- **When duplicate execution is harmless once effects are idempotent** (L74). All-active with dedup is simpler and has no failover.
+- **For per-request exclusion.** That is a lock (L78) or an atomic write.
+- **With a 2-node cluster.** There is no fault tolerance; use 3 or 5.
+- **As a substitute for fencing.** Election without a term enforced at the resource is a split-brain generator.
+- **When the role's work must be instantaneous.** A 15-second failover budget is incompatible with a per-second SLA.
+
+## 15. Common mistakes
+
+1. **No term/epoch**, so two leaders cannot be ordered (§4.2).
+2. **No fencing at the resource**, so a stale leader corrupts state (§11.1).
+3. **TTL shorter than real pauses**, causing churn (§11.2, §9 step 3).
+4. **2-node clusters** with no fault tolerance (§11.6).
+5. **Retry without jitter**, so candidates form a campaign storm (§11.4).
+6. **Not self-demoting on renewal failure**, waiting for expiry instead (§5).
+7. **Alarming on leadership state instead of job outcomes** (§11.3).
+8. **A cold standby**, so failover time is dominated by warm-up (§11.8).
+9. **Not clearing cached state on promotion**, so a new leader acts with old memory (§11.5).
+10. **Election per request**, collapsing throughput (§11.7).
+11. **Trusting "the lease means the old leader stopped"** — it does not (§7.2).
+12. **No monitoring of leadership transitions**, so flapping is invisible.
+13. **Forgetting that a leader without quorum must step down** (Raft's rule; leases approximate it).
+14. **Ignoring the standby's cost** — warm standbys are not free, and someone must own that bill.
+
+## 16. Interview perspective
+
+**What is actually being tested.** Whether you understand leader election as **a term plus a fence plus a failover budget**, not as "a Redis key with a TTL". Strong candidates say "two leaders is worse than no leader, so I need a term and the resource must reject stale terms", and they can decompose failover into detection, election and warm-up. Weak candidates describe a TTL and stop.
+
+**Answers that land well:**
+
+- *"How do you ensure only one node runs the scheduler?"* — "A lease-based election with a term: a conditional UPDATE mints a new term on grant, the holder renews at TTL/3 and self-demotes the moment a renewal fails, and every job it triggers carries the term. Anything downstream rejects a stale term. Failover is about 15 seconds: 13 of detection, 40 milliseconds of election, under a second of warm-up, because the standby replays state continuously."
+- *"What is split-brain and how do you prevent it?"* — "Two nodes both acting as leader, typically after a partition or a stall where the old leader is alive but unreachable. You cannot prevent the *belief*; you prevent the *effect*: quorum-enforced writes if you own the store, fencing tokens at the resource if you do not, or STONITH if you can physically kill the old leader. A lease alone does not help — it only tells you the leader is probably dead."
+- *"Why not just use a short TTL?"* — "Because a lease shorter than the system's pauses flaps. Measured GC pauses of 2.5 seconds mean a TTL needs to be at least ~8 seconds; at 3 seconds we measured 14 leadership changes in 10 minutes, which is far worse than a slower failover."
+- *"How many nodes?"* — "Odd: 3, or 5 across AZs. A 2-node cluster tolerates zero failures — it is strictly worse than a single node with a backup."
+
+**Common interview tasks:** design singleton execution for cron; explain split-brain and three mitigations; decompose a failover budget; choose between election and partitioning; compare etcd/ZooKeeper election with Raft election; explain why a leader without quorum must step down; size a lease given pause measurements.
+
+**Red flags interviewers watch for:**
+
+- "Redis SETNX with a TTL" as a complete answer.
+- No term/epoch, so two leaders cannot be ordered.
+- No fencing, and no awareness that the old leader may still be alive.
+- Not knowing that a lease cannot stop a stalled process from writing.
+- No failover budget, or optimising detection while warm-up dominates.
+- Even-sized clusters, or 2-node clusters.
+- Election used where partitioning or idempotency would do.
+- No numbers: no TTL, no failover time, no quorum size.
+
+## 17. Knowledge check
+
+**Conceptual**
+
+1. Explain why leader election needs a term/epoch, and why a "leader" flag without one cannot resolve a dispute. Then explain the three mechanisms that prevent a partitioned old leader from corrupting shared state, and state which applies when you do not control the resource being written.
+2. Decompose the failover budget into its three parts, and explain why optimising the shortest part is usually wasted effort. Give an example where warm-up dominates by two orders of magnitude, and state the design change that addresses it.
+3. Explain why a short lease TTL can *increase* unavailability, using the relationship between pauses, TTL and churn. Then state the sizing rule and its derivation.
+
+**Practical scenario**
+
+4. BookNook is building a system where 4 workers process 40 partitions of a work queue, and exactly one worker must own the partition-assignment role. Assignment is published to a Postgres table that all workers read. Design the complete election: the mechanism, the TTL and renewal cadence given measured pauses of p99 300 ms and max 2 s, the term and where it is enforced, the standby posture of the non-leaders and what keeps it warm, the failover budget with each component measured, what happens if the leader is network-partitioned for 20 seconds and returns, what the non-leaders do while campaigning (avoiding a storm), the alarms, and the recovery procedure if two workers briefly both publish assignments.
+
+**Calculation**
+
+5. A lease has a TTL of 20 seconds with renewals every 6.7 seconds. Measured pauses: p99 400 ms, max 3.2 seconds. (a) Verify whether the TTL satisfies the `3 × (max pause + RTT)` rule. (b) Compute expected detection time if the leader crashes uniformly at random between renewals. (c) Total the failover budget if election takes 60 ms and warm-up takes 900 ms. (d) Recompute the total if the standby is cold and warm-up takes 240 seconds, and state which component you would optimise.
+
+6. A coordination cluster has 5 nodes, each with 99.9 % availability per month. (a) Compute the quorum size and the number of node failures tolerated. (b) Compute the probability that the cluster cannot form a quorum if failures are independent. (c) Recompute for a 3-node cluster, and (d) for a 2-node cluster, explaining why the last is worse than a single node.
+
+**Progress checklist**
+
+- Phase 1 — Foundations (L1–17): **complete** ✅
+- Phase 2 — Scaling (L18–39): **complete** ✅
+- Phase 3 — Data and Storage (L40–63): **complete** ✅
+- Phase 4 — Distributed Systems (L64–92):
+  - [x] 1. Why distributed systems are difficult (L64)
+  - [x] 2. Partial failures and network partitions (L65)
+  - [x] 3. Clock differences and ordering events (L66)
+  - [x] 4. Synchronous versus asynchronous workflows (L67)
+  - [x] 5. Message queues (L68)
+  - [x] 6. Publish-subscribe systems (L69)
+  - [x] 7. Event streams (L70)
+  - [x] 8. RabbitMQ-style queues versus Kafka-style logs (L71)
+  - [x] 9. Consumer groups, partitions, offsets and ordering (L72)
+  - [x] 10. At-most-once, at-least-once and exactly-once (L73)
+  - [x] 11. Idempotent consumers and deduplication (L74)
+  - [x] 12. Dead-letter queues and retry queues (L75)
+  - [x] 13. Backpressure and load shedding (L76)
+  - [x] 14. Circuit breakers, bulkheads and graceful degradation (L77)
+  - [x] 15. Distributed locks and leases (L78)
+  - [x] **16. Leader election (L79) ← you are here**
+  - [ ] 17. Quorums (L80)
+  - [ ] 18. Consensus and Raft (L81)
+  - [ ] 19. Distributed transactions (L82)
+  - [ ] 20. Two-phase commit (L83)
+  - [ ] 21. Saga pattern (L84)
+  - [ ] 22. Transactional outbox and change data capture (L85)
+  - [ ] 23. Monoliths, modular monoliths, microservices (L86)
+  - [ ] 24. Service discovery and configuration (L87)
+  - [ ] 25. Observability: logs, metrics, traces (L88)
+  - [ ] 26. SLIs, SLOs and error budgets (L89)
+  - [ ] 27. High availability and disaster recovery (L90)
+  - [ ] 28. Active-passive versus active-active (L91)
+  - [ ] 29. RTO and RPO (L92)
+
+**NEXT LESSON: Phase 4, Topic 17 — Quorums**
+
+---

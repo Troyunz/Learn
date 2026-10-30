@@ -25,7 +25,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | 1 — Internet & system-design foundations | 17 | 1–17 | ✅ Complete |
 | 2 — Scaling | 22 | 18–39 | ✅ Complete |
 | 3 — Data & storage | 24 | 40–63 | ✅ **Complete (L55, L59, L63 added; wrap-up done)** |
-| 4 — Distributed systems | 29 | 64–92 | ⏳ In progress — L64–72 done |
+| 4 — Distributed systems | 29 | 64–92 | ⏳ In progress — L64–79 done |
 | 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ Not started |
 
 ## Files
@@ -50,9 +50,11 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | [phase-4-part-1.md](./phase-4-part-1.md) | 64–66 | Phase 4 intro, why distribution is hard, partial failures & partitions, clocks & ordering |
 | [phase-4-part-2.md](./phase-4-part-2.md) | 67–69 | Sync vs async workflows, message queues, publish-subscribe |
 | [phase-4-part-3.md](./phase-4-part-3.md) | 70–72 | Event streams, queues vs logs, consumer groups/partitions/offsets |
+| [phase-4-part-4.md](./phase-4-part-4.md) | 73–75 | Delivery semantics, idempotent consumers & dedup, DLQs and retry queues |
+| [phase-4-part-5.md](./phase-4-part-5.md) | 76–79 | Backpressure & load shedding, circuit breakers/bulkheads, locks & leases, leader election |
 | phase-5-part-*.md | 93–106 | The 14 full system designs — *not started* |
 
-> **Note on `_chunks/`**: this directory holds raw generation output, including draft lessons 73 and 85 that have not yet been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
+> **Note on `_chunks/`**: this directory holds raw generation output, including the draft for lesson 85 that has not yet been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
 
 ## Progress checklist
 
@@ -140,13 +142,13 @@ Legend: `[x]` complete · `[ ]` not started
 - [x] 7. Event streams — L70
 - [x] 8. RabbitMQ-style queues versus Kafka-style logs — L71 ✳ *(written 2026-10)*
 - [x] 9. Consumer groups, partitions, offsets and ordering — L72 ✳ *(written 2026-10)*
-- [ ] 10. At-most-once, at-least-once and exactly-once semantics — L73 *(draft in `_chunks`)*
-- [ ] 11. Idempotent consumers and deduplication — L74
-- [ ] 12. Dead-letter queues and retry queues — L75
-- [ ] 13. Backpressure and load shedding — L76
-- [ ] 14. Circuit breakers, bulkheads and graceful degradation — L77
-- [ ] 15. Distributed locks and leases — L78
-- [ ] 16. Leader election — L79
+- [x] 10. At-most-once, at-least-once and exactly-once semantics — L73 ✳ *(written 2026-10)*
+- [x] 11. Idempotent consumers and deduplication — L74 ✳ *(written 2026-10)*
+- [x] 12. Dead-letter queues and retry queues — L75 ✳ *(written 2026-10)*
+- [x] 13. Backpressure and load shedding — L76 ✳ *(written 2026-10)*
+- [x] 14. Circuit breakers, bulkheads and graceful degradation — L77 ✳ *(written 2026-10)*
+- [x] 15. Distributed locks and leases — L78 ✳ *(written 2026-10)*
+- [x] 16. Leader election — L79 ✳ *(written 2026-10)*
 - [ ] 17. Quorums — L80
 - [ ] 18. Consensus and Raft — L81
 - [ ] 19. Distributed transactions — L82
@@ -171,6 +173,6 @@ Legend: `[x]` complete · `[ ]` not started
 
 ---
 
-**NEXT: Phase 4, Topic 10 — At-most-once, at-least-once and exactly-once semantics (L73)**
+**NEXT: Phase 4, Topic 17 — Quorums (L80)**
 
 For the precise state of every file — including orphaned drafts, stale inline checklists, and the remaining work plan — see [../AUDIT.md](../AUDIT.md).
