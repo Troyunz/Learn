@@ -1,0 +1,4 @@
+pyspark==3.5.1
+pandas==2.2.2
+pytest==8.2.0
+pyyaml==6.0.1

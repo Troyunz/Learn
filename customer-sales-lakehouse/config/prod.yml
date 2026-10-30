@@ -1,0 +1,13 @@
+# Production environment configuration.
+#
+# Loaded by the pipeline scripts to resolve the data root and logging verbosity.
+# Contains NO credentials - secrets must come from environment variables or a
+# secret manager, never from a file committed to source control.
+
+environment: prod
+
+# Absolute mount point for the lakehouse in the production cluster.
+data_root: /mnt/data
+
+# Quieter logging in production; warnings and errors only.
+log_level: WARNING

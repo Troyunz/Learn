@@ -1,0 +1,9 @@
+# Local learning dependencies for the data-engineering-learning repository.
+# Versions are intentionally unpinned so you pick up a build that matches
+# your local Python and Java installation. Pin them once your setup works.
+
+pyspark
+pandas
+pytest
+pyyaml
+python-dotenv

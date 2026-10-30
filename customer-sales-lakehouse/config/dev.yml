@@ -1,0 +1,13 @@
+# Development environment configuration.
+#
+# Loaded by the pipeline scripts to resolve the data root and logging verbosity.
+# Contains NO credentials - secrets must come from environment variables or a
+# secret manager, never from a file committed to source control.
+
+environment: dev
+
+# Root of the lakehouse, relative to the project root.
+data_root: ./data
+
+# Verbose logging while developing.
+log_level: INFO

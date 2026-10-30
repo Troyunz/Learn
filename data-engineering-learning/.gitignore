@@ -1,0 +1,97 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---------------------------------------------------------------------------
+# Environment files / local secrets
+# Never commit real credentials. .env.example is allowed as a template.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.secrets
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# IDE / editor
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Generated pipeline output
+# Bronze / silver / gold / quality results are rebuilt by running the pipeline,
+# so they are never committed.
+# ---------------------------------------------------------------------------
+*.parquet
+*.crc
+_SUCCESS
+_delta_log/
+**/data/bronze/*
+**/data/silver/*
+**/data/gold/*
+**/data/quality_results/*
+**/data/exceptions/*
+
+# Keep the empty output folders in Git so the pipeline has somewhere to write.
+!**/data/bronze/.gitkeep
+!**/data/silver/.gitkeep
+!**/data/gold/.gitkeep
+!**/data/quality_results/.gitkeep
+!**/data/exceptions/.gitkeep
+
+# ---------------------------------------------------------------------------
+# Generated CSV exports
+# IMPORTANT: the sample raw datasets under data/raw/ are the inputs for every
+# exercise in this repository and must stay tracked.
+# ---------------------------------------------------------------------------
+output/
+exports/
+*.out.csv
+!**/data/raw/*.csv
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+logs/
+*.log
+
+# ---------------------------------------------------------------------------
+# Test / tooling cache
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Spark local noise
+# ---------------------------------------------------------------------------
+spark-warehouse/
+metastore_db/
+derby.log

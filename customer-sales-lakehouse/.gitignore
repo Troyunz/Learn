@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Virtual environments / secrets
+.venv/
+.env
+
+# Generated lakehouse layers (raw data is intentionally tracked)
+data/bronze/
+data/silver/
+data/gold/
+data/quality_results/
+
+# OS / IDE noise
+.DS_Store
+.idea/
+.vscode/
