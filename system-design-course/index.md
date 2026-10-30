@@ -52,7 +52,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | [phase-4-part-3.md](./phase-4-part-3.md) | 70–72 | Event streams, queues vs logs, consumer groups/partitions/offsets |
 | phase-5-part-*.md | 93–106 | The 14 full system designs — *not started* |
 
-> **Note on `_chunks/`**: this directory holds raw generation output, including draft lessons 67, 70, 73 and 85 that have not yet been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
+> **Note on `_chunks/`**: this directory holds raw generation output, including draft lessons 73 and 85 that have not yet been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
 
 ## Progress checklist
 

@@ -11,7 +11,7 @@
 | 1 — Foundations | 1–17 + wrap-up | ✅ Complete | ✅ Complete |
 | 2 — Scaling | 18–39 + wrap-up | ✅ Complete (index wrongly said "wrap-up pending") | ✅ Complete |
 | 3 — Data & storage | 40–63 + wrap-up | ⚠️ **3 lessons missing** (L55, L59, L63), wrap-up written but referenced the missing lessons | ✅ **Complete** |
-| 4 — Distributed systems | 64–92 + wrap-up | ⚠️ 5 of 29 lessons existed as **unmerged drafts** (L64, 67, 70, 73, 85) in `_chunks/` | 🔄 Part 1 written: L64–66 |
+| 4 — Distributed systems | 64–92 + wrap-up | ⚠️ 5 of 29 lessons existed as **unmerged drafts** (L64, 67, 70, 73, 85) in `_chunks/` | 🔄 **9 of 29 done**: L64–72 written/merged; 2 drafts left (L73, L85) |
 | 5 — Design exercises | 93–106 + wrap-up | ❌ Nothing | ❌ Nothing |
 
 **Course body before:** 54,581 lines / ~2.9 MB. **Added in this pass:** 4 lessons (L55, L59, L63, L65, L66) plus a phase file structure — see `git log`.
@@ -81,7 +81,7 @@ Every new lesson follows the course's 17-section template and the BookNook examp
 
 ## 4. Remaining work
 
-### 4.1 Phase 4 — 22 lessons to write, 4 drafts to merge, 1 wrap-up
+### 4.1 Phase 4 — 18 lessons to write, 2 drafts to merge, 1 wrap-up
 
 Existing content to merge (drafts in `_chunks/`, complete, 17-section, BookNook-consistent):
 
@@ -95,11 +95,9 @@ Existing content to merge (drafts in `_chunks/`, complete, 17-section, BookNook-
 Lessons still to write, in course order:
 
 ```
-68  Message queues                    78  Distributed locks and leases
-69  Publish-subscribe systems         79  Leader election
-71  Queues vs logs                   80  Quorums
-72  Consumer groups & offsets        81  Consensus and Raft
-74  Idempotent consumers             82  Distributed transactions
+74  Idempotent consumers             80  Quorums
+75  Dead-letter & retry queues       81  Consensus and Raft
+76  Backpressure & load shedding     82  Distributed transactions
 75  Dead-letter & retry queues       83  Two-phase commit
 76  Backpressure and load shedding   84  Saga pattern
 77  Circuit breakers & bulkheads     86  Monoliths vs microservices
@@ -117,8 +115,8 @@ Proposed part-file layout (5–6 lessons per file, matching the Phase 1–3 conv
 | File | Lessons |
 |---|---|
 | `phase-4-part-1.md` ✅ | 64–66 (done) |
-| `phase-4-part-2.md` | 67–69 |
-| `phase-4-part-3.md` | 70–72 |
+| `phase-4-part-2.md` ✅ | 67–69 (done) |
+| `phase-4-part-3.md` ✅ | 70–72 (done) |
 | `phase-4-part-4.md` | 73–75 |
 | `phase-4-part-5.md` | 76–79 |
 | `phase-4-part-6.md` | 80–85 |
