@@ -25,7 +25,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | 1 — Internet & system-design foundations | 17 | 1–17 | ✅ Complete |
 | 2 — Scaling | 22 | 18–39 | ✅ Complete |
 | 3 — Data & storage | 24 | 40–63 | ✅ **Complete (L55, L59, L63 added; wrap-up done)** |
-| 4 — Distributed systems | 29 | 64–92 | ⏳ In progress — L64–85 done |
+| 4 — Distributed systems | 29 | 64–92 | ⏳ In progress — L64–89 done |
 | 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ Not started |
 
 ## Files
@@ -53,6 +53,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | [phase-4-part-4.md](./phase-4-part-4.md) | 73–75 | Delivery semantics, idempotent consumers & dedup, DLQs and retry queues |
 | [phase-4-part-5.md](./phase-4-part-5.md) | 76–79 | Backpressure & load shedding, circuit breakers/bulkheads, locks & leases, leader election |
 | [phase-4-part-6.md](./phase-4-part-6.md) | 80–85 | Quorums, consensus & Raft, distributed transactions, 2PC, sagas, outbox & CDC |
+| [phase-4-part-7.md](./phase-4-part-7.md) | 86–89 | Monoliths vs microservices, discovery & config, observability, SLIs/SLOs |
 | phase-5-part-*.md | 93–106 | The 14 full system designs — *not started* |
 
 > **Note on `_chunks/`**: this directory holds raw generation output from the original build. Every Phase 4 draft it contained has now been merged into the `phase-4-part-*` files. It is a working folder, not part of the course; see [../AUDIT.md](../AUDIT.md).
@@ -156,10 +157,10 @@ Legend: `[x]` complete · `[ ]` not started
 - [x] 20. Two-phase commit — L83 ✳ *(written 2026-10)*
 - [x] 21. Saga pattern — L84 ✳ *(written 2026-10)*
 - [x] 22. Transactional outbox and change data capture — L85 ✳ *(written 2026-10)*
-- [ ] 23. Monoliths, modular monoliths and microservices — L86
-- [ ] 24. Service discovery and configuration management — L87
-- [ ] 25. Observability: logs, metrics, traces — L88
-- [ ] 26. SLIs, SLOs and error budgets — L89
+- [x] 23. Monoliths, modular monoliths and microservices — L86 ✳ *(written 2026-10)*
+- [x] 24. Service discovery and configuration management — L87 ✳ *(written 2026-10)*
+- [x] 25. Observability: logs, metrics, traces — L88 ✳ *(written 2026-10)*
+- [x] 26. SLIs, SLOs and error budgets — L89 ✳ *(written 2026-10)*
 - [ ] 27. High availability and disaster recovery — L90
 - [ ] 28. Active-passive versus active-active — L91
 - [ ] 29. RTO and RPO — L92
@@ -174,6 +175,6 @@ Legend: `[x]` complete · `[ ]` not started
 
 ---
 
-**NEXT: Phase 4, Topic 23 — Monoliths, modular monoliths and microservices (L86)**
+**NEXT: Phase 4, Topic 27 — High availability and disaster recovery (L90)**
 
 For the precise state of every file — including orphaned drafts, stale inline checklists, and the remaining work plan — see [../AUDIT.md](../AUDIT.md).
