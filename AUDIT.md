@@ -11,7 +11,7 @@
 | 1 — Foundations | 1–17 + wrap-up | ✅ Complete | ✅ Complete |
 | 2 — Scaling | 18–39 + wrap-up | ✅ Complete (index wrongly said "wrap-up pending") | ✅ Complete |
 | 3 — Data & storage | 40–63 + wrap-up | ⚠️ **3 lessons missing** (L55, L59, L63), wrap-up written but referenced the missing lessons | ✅ **Complete** |
-| 4 — Distributed systems | 64–92 + wrap-up | ⚠️ 5 of 29 lessons existed as **unmerged drafts** (L64, 67, 70, 73, 85) in `_chunks/` | 🔄 **16 of 29 done**: L64–79 written/merged; 1 draft left (L85) |
+| 4 — Distributed systems | 64–92 + wrap-up | ⚠️ 5 of 29 lessons existed as **unmerged drafts** (L64, 67, 70, 73, 85) in `_chunks/` | 🔄 **22 of 29 done**: L64–85 written/merged; **all drafts merged** |
 | 5 — Design exercises | 93–106 + wrap-up | ❌ Nothing | ❌ Nothing |
 
 **Course body before:** 54,581 lines / ~2.9 MB. **Added in this pass:** 4 lessons (L55, L59, L63, L65, L66) plus a phase file structure — see `git log`.
@@ -81,7 +81,7 @@ Every new lesson follows the course's 17-section template and the BookNook examp
 
 ## 4. Remaining work
 
-### 4.1 Phase 4 — 12 lessons to write, 1 draft to merge, 1 wrap-up
+### 4.1 Phase 4 — 7 lessons to write, 0 drafts to merge, 1 wrap-up
 
 Drafts in `_chunks/` (complete, 17-section, BookNook-consistent) still to merge:
 
@@ -90,19 +90,15 @@ Drafts in `_chunks/` (complete, 17-section, BookNook-consistent) still to merge:
 | `_chunks/L67-69.md` | 67 — Sync vs async workflows | `phase-4-part-2.md` | ✅ merged |
 | `_chunks/L70-72.md` | 70 — Event streams | `phase-4-part-3.md` | ✅ merged |
 | `_chunks/L73-75.md` | 73 — At-most/at-least/exactly-once | `phase-4-part-4.md` | ✅ merged |
-| `_chunks/L85-87.md` | 85 — Transactional outbox & CDC | `phase-4-part-6.md` | ⏳ pending |
+| `_chunks/L85-87.md` | 85 — Transactional outbox & CDC | `phase-4-part-6.md` | ✅ merged (draft extended §8–17) |
 
-Lessons still to write, in course order (12):
+Lessons still to write, in course order (7):
 
 ```
-80  Quorums                           85  Transactional outbox & CDC (draft)
-81  Consensus & Raft                  86  Monoliths vs microservices
-82  Distributed transactions          87  Service discovery & config
-83  Two-phase commit                  88  Observability
-84  Saga pattern                      89  SLIs, SLOs, error budgets
-                                       90  High availability & DR
-                                       91  Active-passive vs active-active
-                                       92  RTO and RPO
+86  Monoliths vs microservices        90  High availability & DR
+87  Service discovery & config        91  Active-passive vs active-active
+88  Observability                     92  RTO and RPO
+89  SLIs, SLOs, error budgets
 + Phase 4 wrap-up
 ```
 
@@ -115,8 +111,8 @@ Proposed part-file layout (5–6 lessons per file, matching the Phase 1–3 conv
 | `phase-4-part-3.md` ✅ | 70–72 (done) |
 | `phase-4-part-4.md` ✅ | 73–75 (done) |
 | `phase-4-part-5.md` ✅ | 76–79 (done) |
-| `phase-4-part-6.md` 🔄 | 80–85 (next) |
-| `phase-4-part-7.md` | 86–89 |
+| `phase-4-part-6.md` ✅ | 80–85 (done) |
+| `phase-4-part-7.md` 🔄 | 86–89 (next) |
 | `phase-4-part-8.md` | 90–92 + Phase 4 wrap-up |
 
 ### 4.2 Phase 5 — 14 designs + wrap-up
