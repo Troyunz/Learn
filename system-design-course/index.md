@@ -26,7 +26,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | 2 — Scaling | 22 | 18–39 | ✅ Complete |
 | 3 — Data & storage | 24 | 40–63 | ✅ **Complete (L55, L59, L63 added; wrap-up done)** |
 | 4 — Distributed systems | 29 | 64–92 | ✅ **Complete (L64–92 + wrap-up)** |
-| 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ In progress — L93–95 done |
+| 5 — Complete system-design exercises | 14 designs | 93–106 | ⏳ In progress — L93–98 done |
 
 ## Files
 
@@ -55,6 +55,7 @@ A structured, practical course. Every lesson uses one continuing example — **B
 | [phase-4-part-6.md](./phase-4-part-6.md) | 80–85 | Quorums, consensus & Raft, distributed transactions, 2PC, sagas, outbox & CDC |
 | [phase-4-part-7.md](./phase-4-part-7.md) | 86–89 | Monoliths vs microservices, discovery & config, observability, SLIs/SLOs |
 | [phase-5-part-1.md](./phase-5-part-1.md) | 93–95 | Design Pastebin, URL shortener, rate limiter |
+| [phase-5-part-2.md](./phase-5-part-2.md) | 96–98 | Design notification service, search autocomplete, file storage |
 | [phase-4-part-8.md](./phase-4-part-8.md) | 90–92 + wrap-up | HA & DR, active-passive vs active-active, RTO/RPO, **Phase 4 revision sheet, glossary, 20 quiz questions, exercises** |
 | phase-5-part-*.md | 93–106 | The 14 full system designs — *not started* |
 
@@ -169,14 +170,14 @@ Legend: `[x]` complete · `[ ]` not started
 - [x] Phase 4 wrap-up ✳ *(revision sheet, glossary, 20 quiz questions, 5 exercises, mini design, interview questions)*
 
 ### Phase 5 — Complete system-design exercises (L93–L106)
-- [x] 1. Pastebin (L93) ✳ · [x] 2. URL shortener (L94) ✳ · [x] 3. Rate limiter (L95) ✳ · [ ] 4. Notification service
-- [ ] 5. Search autocomplete · 6. File storage · 7. Web crawler · 8. Real-time chat
+- [x] 1. Pastebin (L93) ✳ · [x] 2. URL shortener (L94) ✳ · [x] 3. Rate limiter (L95) ✳ · [x] 4. Notification service (L96) ✳
+- [x] 5. Search autocomplete (L97) ✳ · [x] 6. File storage (L98) ✳ · [ ] 7. Web crawler · [ ] 8. Real-time chat
 - [ ] 9. News feed · 10. Video streaming · 11. Ride sharing · 12. E-commerce/inventory
 - [ ] 13. Payment processing · 14. Metrics and logging platform
 - [ ] Phase 5 wrap-up
 
 ---
 
-**NEXT: Phase 5, Topic 4 — Design a notification service (L96)**
+**NEXT: Phase 5, Topic 7 — Design a web crawler (L99)**
 
 For the precise state of every file — including orphaned drafts, stale inline checklists, and the remaining work plan — see [../AUDIT.md](../AUDIT.md).
