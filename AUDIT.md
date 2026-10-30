@@ -83,30 +83,27 @@ Every new lesson follows the course's 17-section template and the BookNook examp
 
 ### 4.1 Phase 4 — 18 lessons to write, 2 drafts to merge, 1 wrap-up
 
-Existing content to merge (drafts in `_chunks/`, complete, 17-section, BookNook-consistent):
+Drafts in `_chunks/` (complete, 17-section, BookNook-consistent) still to merge:
 
-| Draft | Lesson | Merge into |
-|---|---|---|
-| `_chunks/L67-69.md` | 67 — Sync vs async workflows | `phase-4-part-2.md` |
-| `_chunks/L70-72.md` | 70 — Event streams | `phase-4-part-3.md` |
-| `_chunks/L73-75.md` | 73 — At-most/at-least/exactly-once | `phase-4-part-4.md` |
-| `_chunks/L85-87.md` | 85 — Transactional outbox & CDC | `phase-4-part-6.md` |
+| Draft | Lesson | Merge into | Status |
+|---|---|---|---|
+| `_chunks/L67-69.md` | 67 — Sync vs async workflows | `phase-4-part-2.md` | ✅ merged |
+| `_chunks/L70-72.md` | 70 — Event streams | `phase-4-part-3.md` | ✅ merged |
+| `_chunks/L73-75.md` | 73 — At-most/at-least/exactly-once | `phase-4-part-4.md` | ⏳ pending |
+| `_chunks/L85-87.md` | 85 — Transactional outbox & CDC | `phase-4-part-6.md` | ⏳ pending |
 
-Lessons still to write, in course order:
+Lessons still to write, in course order (18):
 
 ```
-74  Idempotent consumers             80  Quorums
-75  Dead-letter & retry queues       81  Consensus and Raft
-76  Backpressure & load shedding     82  Distributed transactions
-75  Dead-letter & retry queues       83  Two-phase commit
-76  Backpressure and load shedding   84  Saga pattern
-77  Circuit breakers & bulkheads     86  Monoliths vs microservices
-                                     87  Service discovery & config
-                                     88  Observability
-                                     89  SLIs, SLOs, error budgets
-                                     90  High availability & DR
-                                     91  Active-passive vs active-active
-                                     92  RTO and RPO
+74  Idempotent consumers              83  Two-phase commit
+75  Dead-letter & retry queues        84  Saga pattern
+76  Backpressure & load shedding      86  Monoliths vs microservices
+77  Circuit breakers & bulkheads      87  Service discovery & config
+78  Distributed locks & leases        88  Observability
+79  Leader election                   89  SLIs, SLOs, error budgets
+80  Quorums                           90  High availability & DR
+81  Consensus & Raft                  91  Active-passive vs active-active
+82  Distributed transactions          92  RTO and RPO
 + Phase 4 wrap-up
 ```
 
